@@ -32,7 +32,7 @@ Each setup has a complete, working example project to copy, whose README's "How 
 6. Write a first query and run it with the project's own driver: https://reylo.dev/#usage and https://reylo.dev/#run
    For more queries, from nested JSON to bulk inserts, see https://reylo.dev/#inference
 7. Run the typecheck script. The query's types come from the database; an error in a .sql file shows at its line and column.
-8. Install Reylo's agent skill, which gives later sessions its rules for writing queries: npx skills add colinhacks/reylo --skill using-reylo
+8. Install Reylo's agent skill, which gives later sessions its rules for writing queries: npx skills add colinhacks/reylo --skill reylo
 ```
 
 </AgentPrompt>
@@ -409,7 +409,7 @@ Zed doesn't send `.sql` files to the language server, so an error inside one sho
 Install Reylo's agent skill, which gives your coding agent Reylo's rules for writing and running queries in every session:
 
 ```sh
-npx skills add colinhacks/reylo --skill using-reylo
+npx skills add colinhacks/reylo --skill reylo
 ```
 
 </div>
