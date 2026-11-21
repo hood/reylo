@@ -17,6 +17,7 @@ on:
       - engine/cli/**
       - engine/native/**
       - engine/migrate/**
+      - engine/syntax/**
       - rust/reylo-build/**
       - npm/**
       - scripts/build.ts
@@ -25,6 +26,7 @@ on:
       - src/engine.ts
       - .cargo/**
       - Cargo.lock
+      - rust-toolchain.toml
       - .github/scripts/build-binary.sh
       - .github/scripts/install-check.ts
       - .github/workflows/binaries.yml

@@ -27,9 +27,8 @@
 // the fields of has the kind of its column whatever its oid: `record` is one oid for every shape of
 // row, and a built-in catalog table's row type is below 10000 too.
 import { civilFromDays, coerce, DecodeError, elementKind, isRowKind, numbersInJson, scalarKind, textDecoder, utf8, withFraction, withinDimensions, type Columns, type Decoder, type JsonNumbers, type Kind } from "./values.ts";
-import { lexPlaceholders } from "./lex.ts";
 import { lastOfEach, rowOf, type RowBuilder } from "./row.ts";
-import { arrayLiteral, asByteaHex, isJsonValue, jsonText, jsonValue, postgresText, type AnyClient as Client, type Bound, type QueryModule, type Runtime } from "./execute.ts";
+import { arrayLiteral, asByteaHex, isJsonValue, jsonText, jsonValue, postgresText, type AnyClient as Client, type Bound, type Marks, type QueryModule, type Runtime } from "./execute.ts";
 import { readPostgresError } from "./query-error.ts";
 
 type AnyClient = Record<string, any>;
@@ -410,6 +409,32 @@ export async function postgresJs(c: AnyClient, text: string, params: unknown[], 
   const transformed = `Reylo cannot read this postgres.js client's rows: its transform.row rewrites every row, Reylo's too, so they would not have the types the query declares. Run Reylo's queries on a postgres() instance without transform.row.`;
   const load: Load = async (sql) => ((await c.unsafe(sql).raw()) as (BufferLike | null)[][]).map((r) => r.map((v) => (v === null ? null : textOf(v))));
   return await rawRows(raw, columns, c, load, row, transformed);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Drizzle's Postgres driver (`drizzle-orm/postgres/client`): a query in its `buffer` mode hands over each value as the bytes of the server's text, past every decoder
+// the app set up (`types`, `int8`, `temporal`, `jsonBigints`), and `debug` names each column's type.
+
+/** Whether `c` is an instance of one of the driver's classes, each of which carries a global symbol, so a method another driver's client happens to have never matches. */
+const isDrizzleClass = (c: AnyClient, ...classes: string[]) => classes.some((name) => (c as Record<symbol, unknown>)[Symbol.for(`@drizzle/postgres:${name}`)] === true);
+
+/** Drizzle's Pool and its Connection, on every runtime it connects from: a transaction's and an acquired connection are Connections too. */
+const isDrizzlePostgres = (c: AnyClient) => isDrizzleClass(c, "Pool", "Connection");
+
+/** Drizzle's HTTP clients, and an Aurora transaction, which inherits from its client. Their results name no column's type. */
+const isDrizzleHttp = (c: AnyClient) => isDrizzleClass(c, "NeonHttpClient", "HttpClient", "AuroraClient");
+
+const refuseDrizzleHttp = () =>
+  new TypeError("Reylo cannot read the results of Drizzle's HTTP clients (neon-http, http and aurora), which name no column's type. Pass Drizzle's Pool or a Connection, from neon-ws for Neon.");
+
+async function drizzlePostgres(c: AnyClient, text: string, params: unknown[], columns: Columns | undefined, row?: RowBuilder): Promise<unknown[]> {
+  // Unnamed, so the server sends every column as text: only a statement the app named takes binary columns on its later runs.
+  const result = await c.query(text, params, { mode: "buffer", debug: true });
+  const described: { name: string; oid: number }[] | undefined = result?.debug?.columns;
+  if (!Array.isArray(result?.rows) || !Array.isArray(described)) throw new TypeError("Reylo cannot read this client's results: its query() in buffer mode named no column's type.");
+  const raw = Object.assign(result.rows as unknown[], { columns: described.map((f) => ({ name: f.name, type: f.oid })) });
+  const load: Load = async (sql) => ((await c.query(sql, [], { mode: "buffer" })).rows as (BufferLike | null)[][]).map((r) => r.map((v) => (v === null ? null : textOf(v))));
+  return await rawRows(raw, columns, c, load, row, "Reylo cannot read this client's rows: its query() in buffer mode handed over no array of each value's bytes.");
 }
 
 /**
@@ -809,27 +834,36 @@ function slonikTag(c: AnyClient): SlonikTag {
   return tag;
 }
 
-/** `text`, a statement with `$n` placeholders each used once, as a template literal's strings, and its values in that order. */
-function slonikTemplate(text: string, values: readonly unknown[]): [TemplateStringsArray, unknown[]] {
-  const { params, placeholders } = lexPlaceholders(text, "postgres");
+/**
+ * `text`, a statement with `$n` placeholders each used once, as a template literal's strings, and
+ * its values in that order: the strings are the text between the marks, the engine's places of
+ * the placeholders, and each value is the one its placeholder's number names.
+ */
+function slonikTemplate(text: string, marks: Marks | undefined, values: readonly unknown[]): [TemplateStringsArray, unknown[]] {
+  if (marks === undefined) throw new TypeError(`Reylo cannot run this statement on Slonik, whose sql tag takes a statement as the strings between its values: a query defined by hand needs \`marks\` there, the place of each placeholder in its text, which a build step writes.`);
+  const numbers = marks.map(([start, end]) => {
+    const written = text.slice(start, end);
+    if (!/^\$[0-9]+$/.test(written)) throw new TypeError(`Reylo cannot run this statement on Slonik: its mark at ${start} covers ${JSON.stringify(written)}, not a placeholder such as $1.`);
+    return Number(written.slice(1));
+  });
   // A query defined by hand may use a parameter twice, which the type check refuses: Slonik's tag
   // binds every value on its own, so the second use would be a parameter of its own type.
-  if (placeholders.length > params.length) {
+  if (new Set(numbers).size < numbers.length) {
     throw new TypeError(`Reylo cannot run this statement on Slonik: it uses a parameter more than once, and Slonik's sql tag binds each use on its own, so the server would type each one separately. Use each parameter once, and select it in a with to read it twice.`);
   }
   const strings: string[] = [];
   let last = 0;
-  for (const p of placeholders) {
-    strings.push(text.slice(last, p.start));
-    last = p.end;
+  for (const [start, end] of marks) {
+    strings.push(text.slice(last, start));
+    last = end;
   }
   strings.push(text.slice(last));
   // A tag takes only what a template literal gives it: frozen strings and their raw form.
   const template = Object.freeze(Object.assign(strings, { raw: Object.freeze([...strings]) })) as unknown as TemplateStringsArray;
-  return [template, placeholders.map((p) => values[Number(p.name) - 1])];
+  return [template, numbers.map((n) => values[n - 1])];
 }
 
-export async function slonik(c: AnyClient, text: string, values: readonly unknown[], columns: Columns | undefined): Promise<unknown[]> {
+export async function slonik(c: AnyClient, text: string, marks: Marks | undefined, values: readonly unknown[], columns: Columns | undefined): Promise<unknown[]> {
   // An interceptor's transformRow or transformRowAsync renames the columns
   // (slonik-interceptor-field-name-transformation) or rewrites each row, which Reylo's types would
   // no longer describe. It is refused before the statement runs, since a write that committed and
@@ -837,7 +871,7 @@ export async function slonik(c: AnyClient, text: string, values: readonly unknow
   const interceptors = (c.configuration ?? c.clientConfiguration)?.interceptors as { transformRow?: unknown; transformRowAsync?: unknown }[] | undefined;
   if (interceptors?.some((i) => typeof i?.transformRow === "function" || typeof i?.transformRowAsync === "function")) throw refuseSlonikRows();
   const tag = slonikTag(c);
-  const [template, ordered] = slonikTemplate(text, values);
+  const [template, ordered] = slonikTemplate(text, marks, values);
   const query = tag.unsafe(template, ...ordered);
   if (query.typeParsers === undefined) {
     throw new TypeError(`Reylo cannot run on this Slonik: its sql tag takes no type parsers per query (createSqlTag's typeParsers option), so its pool's parsers would turn numeric, timestamp and interval values into lossy numbers. Upgrade slonik to 49.12.0 or later.`);
@@ -897,7 +931,7 @@ function slonikParam(v: unknown): unknown {
 }
 
 /** A Postgres statement's rows on each Postgres driver's client, or undefined on any other client. */
-async function runPostgres(c: Client, query: QueryModule<"postgres">, { text, values, names }: Bound): Promise<unknown[] | undefined> {
+async function runPostgres(c: Client, query: QueryModule<"postgres">, { text, values, names, marks }: Bound): Promise<unknown[] | undefined> {
   const type = (i: number) => query.inputs?.[names[i]!]?.type;
   const isJsonParam = (v: unknown, i: number) => isJsonValue(query, names[i]!, v);
   // An array for a SQL array parameter goes as its literal text, which the server reads as
@@ -915,10 +949,16 @@ async function runPostgres(c: Client, query: QueryModule<"postgres">, { text, va
   // parameter itself, so JSON text would be stored as a JSON string, and it types a boolean,
   // a number or an array of either by its JavaScript type ("cannot cast type boolean to
   // jsonb"): it gets an object whose toJSON() returns the value, which it binds as JSON and
-  // serializes to exactly its JSON text. So does an unsafe() client without typed().
+  // serializes to exactly its JSON text. So does an unsafe() client without typed(). A Bun.sql
+  // client made with `prepare: false`, as one behind a pooler in transaction mode is, learns no
+  // parameter's type and sends an object as its String() ("invalid input syntax for type json"),
+  // so it gets the JSON text, which the server reads as the parameter's type.
   const json = () => bound.map((v, i) => (isJsonParam(v, i) ? jsonText(v) : v));
   // Slonik before every other query(): its query() takes only its sql tag's queries.
-  if (isSlonik(c)) return await slonik(c, text, json().map(slonikParam), query.columns);
+  if (isSlonik(c)) return await slonik(c, text, marks, json().map(slonikParam), query.columns);
+  // Drizzle's driver writes an array as its literal and binds a Uint8Array as bytea, as pg does.
+  if (isDrizzlePostgres(c)) return await drizzlePostgres(c, text, json(), query.columns, query.row);
+  if (isDrizzleHttp(c)) throw refuseDrizzleHttp();
   // query() before unsafe(): Neon's neon() has both, and its unsafe() builds a fragment
   // for a template instead of running anything. Reylo decodes every value itself, so a client
   // that is none of the drivers' is refused before it runs anything (`takesQuery`).
@@ -944,7 +984,9 @@ async function runPostgres(c: Client, query: QueryModule<"postgres">, { text, va
     // declared `unknown`, and postgres.js never learns its types. postgres.js 3 sends such a value
     // as it is either way. A query without inputs gets its values as they are, as on every driver.
     const bun = typeof c.commitDistributed === "function";
-    const mapped = bun ? bound.map((v, i) => (isJsonParam(v, i) ? { toJSON: () => jsonValue(v) } : v)) : query.inputs ? bound.map((v, i) => c.typed(postgresText(query, names[i]!, v), 705)) : bound;
+    // Each handle Bun.sql gives out, a transaction's, a savepoint's and a reserved connection's too, carries its client's options.
+    const bunJson = bun && c.options?.prepare === false ? jsonText : (v: unknown) => ({ toJSON: () => jsonValue(v) });
+    const mapped = bun ? bound.map((v, i) => (isJsonParam(v, i) ? bunJson(v) : v)) : query.inputs ? bound.map((v, i) => c.typed(postgresText(query, names[i]!, v), 705)) : bound;
     if (!bun) return await postgresJs(c, text, mapped, query.columns, query.row);
     return (await bunRaw(c, text, mapped, query.columns, query.row)) ?? bunRows(await c.unsafe(text, mapped), query.columns, true);
   }

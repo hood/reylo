@@ -75,6 +75,9 @@ drizzleJob("bun-sql", "Postgres 14 (local)", { bun: true });
 drizzleJob("planetscale-serverless", "MySQL 8.4 via ps-http-sim");
 drizzleJob("bun-sqlite", "SQLite file", { bun: true, sqlite: true });
 drizzleJob("d1", "D1 (Miniflare, local workerd)");
+// Drizzle's own Postgres driver, which drizzle-orm 1.0 carries as drizzle-orm/postgres/client.
+const drizzle1 = "1.0.0-rc.6";
+for (const [transport, target] of [["tcp", "Postgres 14 (local)"], ["neon-ws", "Postgres 14 via local Neon proxy"]]) add({ id: `drizzle-orm@${drizzle1}/postgres/client (${transport})`, bin: NODE26, file: "drivers/drizzle-postgres.ts", args: ["--pkg", "drizzle-orm-1", "--version", drizzle1, "--transport", transport!], meta: { pkg: `drizzle-orm/postgres/client (${transport})`, version: drizzle1, target: target!, runtime: n26 } });
 
 // SQLite
 for (const [alias, v] of [["bs3-13", "13.0.3"], ["bs3-12", "12.11.1"]]) add({ id: `better-sqlite3@${v}`, bin: NODE26, file: "drivers/sync-sqlite.ts", args: ["--lib", alias, "--version", v], sqlite: true, meta: { pkg: "better-sqlite3", version: v, target: "SQLite file", runtime: n26 } });
@@ -96,6 +99,7 @@ for (const [alias, v] of [["sqlite3-5", "5.1.7"], ["sqlite3-6", "6.0.1"]]) {
   add({ id: `sqlite@5.1.1/sqlite3@${v}`, bin: NODE26, file: "drivers/sqlite3.ts", args: ["--wrapper", "sqlite", "--pkg", alias, "--version", "5.1.1", "--driverVersion", v], sqlite: true, meta: { pkg: "sqlite", version: "5.1.1", target: `SQLite file (over sqlite3 ${v})`, runtime: n26 } });
 }
 add({ id: "sqlite-wasm@3.54.1-build1", bin: NODE26, file: "drivers/wasm-sqlite.ts", args: ["--lib", "sqlite-wasm", "--version", "3.54.1-build1"], sqlite: true, meta: { pkg: "@sqlite.org/sqlite-wasm", version: "3.54.1-build1", target: "SQLite file, copied into memory", runtime: n26 } });
+add({ id: "sql.js@1.17.0", bin: NODE26, file: "drivers/wasm-sqlite.ts", args: ["--lib", "sql.js", "--pkg", "sql-js-117", "--version", "1.17.0"], sqlite: true, meta: { pkg: "sql.js", version: "1.17.0", target: "SQLite file, copied into memory", runtime: n26 } });
 add({ id: "sql.js@1.15.2", bin: NODE26, file: "drivers/wasm-sqlite.ts", args: ["--lib", "sql.js", "--version", "1.15.2"], sqlite: true, meta: { pkg: "sql.js", version: "1.15.2", target: "SQLite file, copied into memory", runtime: n26 } });
 add({ id: "d1/miniflare@4.20260730.0", bin: NODE26, file: "drivers/d1.ts", args: ["--pkg", "miniflare-4", "--version", "4.20260730.0"], meta: { pkg: "miniflare D1", version: "4.20260730.0", target: "D1 (Miniflare, local workerd)", runtime: n26 } });
 

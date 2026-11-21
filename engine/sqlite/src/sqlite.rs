@@ -227,20 +227,29 @@ fn run(sql: &str, lexed: &Lexed, ddl: &[String], extras: &Extras, marked: &[Stri
     let numbered = lex::rewrite(sql, lexed, Target::Numbered);
     let rewritten = lex::rewrite(sql, lexed, Target::Question);
     let functions: Vec<(&str, i32)> = extras.total.iter().map(|f| (f.name.as_str(), f.arity)).collect();
-    // Triggers are not replayed (a body may call a function only the application registers);
-    // their headers say which statements a trigger can skip a row of. An INSTEAD OF trigger is
-    // replayed with an empty body, which is what lets a write to its view through.
-    let (triggers, mut replay): (Vec<String>, Vec<String>) = ddl.iter().cloned().partition(|s| trigger_header(s).is_some());
-    replay.extend(triggers.iter().filter_map(|s| instead_of_stub(s)));
+    let (triggers, replay) = replayed(ddl);
     let skipping = skipping_triggers(&triggers);
-    let listed: Option<Vec<tree::Listed>> = extras.host.as_ref().map(|host| host.iter().map(|f| (f.name.as_str(), f.arity, f.kind)).collect());
-    let t = match tree::analyze(&replay, &numbered.sql, &rewritten.sql, &functions, listed.as_deref()) {
+    let listed = listed(extras.host.as_deref());
+    // libSQL's `ALTER TABLE t ALTER COLUMN c TO <definition>` is prepared as the RENAME COLUMN of
+    // the same column, which SQLite has, to a name no table has: it prepares where libSQL's does,
+    // on an existing table and column, and the definition is libSQL's to read when it runs.
+    let alter = if lexed.params.is_empty() { alter_column(&numbered.sql) } else { None };
+    let (prepared, sent) = match &alter {
+        Some((stand_in, _)) => (stand_in.as_str(), stand_in.as_str()),
+        None => (numbered.sql.as_str(), rewritten.sql.as_str()),
+    };
+    let t = match tree::analyze(&replay, prepared, sent, &functions, listed.as_deref()) {
         Ok(t) => t,
         Err(message) => return failed(bare(sql, lexed, Dialect::Sqlite, vec![diag(message, 0, sql.trim_end().len(), 6)])),
     };
     let mut diagnostics = Vec::new();
     if let Some(err) = &t.error {
-        let start = usize::try_from(err.offset).map_or(0, |o| numbered.to_original(o)).min(sql.len());
+        // An offset into the stand-in past its RENAME is one character past the ALTER it replaced.
+        let offset = |o: usize| match &alter {
+            Some((_, after)) if o >= *after => o - 1,
+            _ => o,
+        };
+        let start = usize::try_from(err.offset).map_or(0, |o| numbered.to_original(offset(o))).min(sql.len());
         let length = match err.length {
             Some(length) if err.offset >= 0 => length,
             _ if err.offset >= 0 => token_len(&sql[start..]),
@@ -312,11 +321,11 @@ fn run(sql: &str, lexed: &Lexed, ddl: &[String], extras: &Extras, marked: &[Stri
             ordered: false,
             value: false,
             rewritten,
+            sql_mode: None,
             style: lexed.style,
             diagnostics,
             unresolved: Vec::new(),
             structured: Vec::new(),
-            fresh: None,
             errors: None,
             capabilities: Some(capabilities),
             read_only: false,
@@ -372,11 +381,11 @@ fn run(sql: &str, lexed: &Lexed, ddl: &[String], extras: &Extras, marked: &[Stri
         ordered: false,
         value: false,
         rewritten,
+        sql_mode: None,
         style: lexed.style,
         diagnostics,
         unresolved: Vec::new(),
         structured: Vec::new(),
-        fresh: None,
         errors: None,
         capabilities: Some(crate::capabilities::of_statement(&t)),
         read_only: false,
@@ -387,6 +396,39 @@ fn run(sql: &str, lexed: &Lexed, ddl: &[String], extras: &Extras, marked: &[Stri
     crate::analysis::names(sql, Dialect::Sqlite, &mut analysis, result_targets(&t).as_deref(), &|_| None);
     let unique_keys = t.tables.iter().map(|(name, info)| (name.clone(), info.unique_keys.clone())).collect();
     SqliteAnalysis { analysis, declared: t.columns.iter().map(|c| c.declared.clone()).collect(), readonly: t.readonly, unique_keys, booleans }
+}
+
+/// The schema's triggers, and what the engine replays of the schema. Triggers are not replayed (a
+/// body may call a function only the application registers); their headers say which statements a
+/// trigger can skip a row of. An INSTEAD OF trigger is replayed with an empty body, which is what
+/// lets a write to its view through.
+fn replayed(ddl: &[String]) -> (Vec<String>, Vec<String>) {
+    let (triggers, mut replay): (Vec<String>, Vec<String>) = ddl.iter().cloned().partition(|s| trigger_header(s).is_some());
+    replay.extend(triggers.iter().filter_map(|s| instead_of_stub(s)));
+    (triggers, replay)
+}
+
+/// The host's functions as the walker takes them.
+fn listed(host: Option<&[HostFunction]>) -> Option<Vec<tree::Listed<'_>>> {
+    host.map(|host| host.iter().map(|f| (f.name.as_str(), f.arity, f.kind)).collect())
+}
+
+/// Whether the table an INSERT writes declares its PRIMARY KEY or a UNIQUE ON CONFLICT REPLACE, as
+/// the embedded SQLite parsed the schema ([`tree::TableInfo::replaces`]), however its DDL spells
+/// the clause: the INSERT, with no OR clause of its own, then deletes the row it conflicts with,
+/// and a foreign key's action follows the delete. The statement is prepared again on the replay
+/// the analysis made, from the same answers. True where it does not prepare, or writes no table
+/// the tree describes.
+pub(crate) fn declares_replace(analysis: &Analysis, host: &Host) -> Lazy<bool> {
+    let schema = host.query(DDL_QUERY, Vec::new(), Scope::Session);
+    let functions = host.query(FUNCTIONS_QUERY, Vec::new(), Scope::Session);
+    let (Ok(rows), functions) = (schema?, functions?) else { return Some(true) };
+    let ddl: Vec<String> = rows.iter().filter_map(|r| r.first().and_then(as_str)).map(String::from).collect();
+    let host_functions = functions.ok().and_then(|rows| host_functions(&rows));
+    let (_, replay) = replayed(&ddl);
+    let sql = &analysis.rewritten.sql;
+    let Ok(t) = tree::analyze(&replay, sql, sql, &[], listed(host_functions.as_deref()).as_deref()) else { return Some(true) };
+    Some(t.dml.as_ref().and_then(|dml| t.tables.get(&dml.table)).is_none_or(|info| info.replaces))
 }
 
 /// Whether a WITH query reads itself: an arm of its statement has a FROM item SQLite marks as the
@@ -402,7 +444,7 @@ fn reads_itself(sel: &Sel) -> bool {
     false
 }
 
-/// The tables the statement names, as SQLite resolved them, for the freshness facts: each table
+/// The tables the statement names, as SQLite resolved them, for its errors pass: each table
 /// and view a FROM clause reads, in subqueries, WITH queries and expressions too, and the table it
 /// writes. A view is named, never what it reads; a WITH query, a subquery and a table-valued
 /// function are no table. SQLite expands a view into a subquery as it does a derived table, and
@@ -913,9 +955,16 @@ fn in_json(t: &Ty) -> Ty {
     }
 }
 
-/// Whether a type already admits a JSON null, so a field of it needs no `| null`.
-fn admits_null(t: &Ty) -> bool {
-    matches!(t, Ty::Unknown | Ty::Json { schema: None })
+/// Whether a value may be JSON's null inside the JSON a function builds: one that may be NULL,
+/// which SQLite writes there as null, and any value of plain JSON, which may be the document `null`
+/// itself however NOT NULL it is (`json(doc)` where `doc` holds `'null'`), as on Postgres and
+/// MySQL. A value of no known type is left as it is: `unknown` already admits null.
+fn nullable_in_json(f: &JsonFact) -> bool {
+    match f.ty {
+        Ty::Unknown => false,
+        Ty::Json { schema: None } => true,
+        _ => !f.non_null,
+    }
 }
 
 /// The JSON Schema of a value inside a document SQLite built, as src/schema.ts spells SQLite's
@@ -1099,6 +1148,32 @@ fn nulls_with(n: &Node, extras: &Extras) -> HashSet<(i64, String)> {
         "function" if !n.agg && !n.window && n.name.as_deref().is_some_and(|f| STRICT.contains(&f) && extras.function(f, n.args.len()).is_none()) => n.args.iter().flat_map(|x| nulls_with(x, extras)).collect(),
         _ => HashSet::new(),
     }
+}
+
+/// The RENAME COLUMN that stands in for libSQL's `ALTER TABLE t ALTER [COLUMN] c TO <definition>`
+/// ([`run`]): the statement up to its second ALTER, `rename`, the statement on to its TO, and a
+/// name no table has; with the byte offset in it where the statement's own text resumes, one past
+/// where it does in the statement. `None` for any other statement.
+fn alter_column(sql: &str) -> Option<(String, usize)> {
+    let words = words(sql);
+    let keyword = |i: usize, want: &str| words.get(i).is_some_and(|(w, quoted, _)| !quoted && w.eq_ignore_ascii_case(want));
+    if !keyword(0, "alter") || !keyword(1, "table") {
+        return None;
+    }
+    // The table's name, with its schema when it has one.
+    let alter = if keyword(3, ".") { 5 } else { 3 };
+    if !keyword(alter, "alter") {
+        return None;
+    }
+    let column = if keyword(alter + 1, "column") { alter + 2 } else { alter + 1 };
+    if !keyword(column + 1, "to") {
+        return None;
+    }
+    // `words` counts characters; the text is sliced by bytes.
+    let byte = |chars: usize| sql.char_indices().nth(chars).map_or(sql.len(), |(at, _)| at);
+    let at = byte(words[alter].2);
+    let to = byte(words[column + 1].2) + 2;
+    Some((format!("{}rename{} \"reylo libsql column\"", &sql[..at], &sql[at + 5..to]), at + 6))
 }
 
 /// The words of a statement as SQLite's tokenizer splits them: a name or a keyword, and each
@@ -1430,6 +1505,8 @@ impl Analyzer<'_> {
             "collate" => n.left.as_deref().is_some_and(|l| self.truth(l, scope, declared)),
             "function" if !n.agg && !n.window => match n.name.as_deref().unwrap_or("") {
                 "like" | "glob" | "regexp" | "match" => self.extras.function(n.name.as_deref().unwrap_or(""), n.args.len()).is_none(),
+                // sqlean's tests, which answer 1 or 0.
+                "starts_with" | "text_has_prefix" | "text_has_suffix" | "text_contains" | "text_like" | "regexp_like" => self.extras.function(n.name.as_deref().unwrap_or(""), n.args.len()).is_none(),
                 "likely" | "unlikely" | "likelihood" => n.args.first().is_some_and(|a| self.truth(a, scope, declared)),
                 "coalesce" | "ifnull" => every(&mut n.args.iter()),
                 "iif" | "if" => every(&mut iif_values(n.args.len()).into_iter().filter_map(|i| n.args.get(i))),
@@ -1565,6 +1642,10 @@ impl Analyzer<'_> {
             if let Some(f) = froms.iter().find(|f| f.cursor == n.cursor) {
                 let index = n.index.max(0) as usize;
                 let inner = match (&f.subquery, f.table.as_deref()) {
+                    (None, Some("vector_top_k")) if f.tab_func && n.column.as_deref().is_some_and(|c| c.eq_ignore_ascii_case("id")) => self.vector_key(f),
+                    // sqlean's series, which Turso Cloud loads: an integer per row, wrapping round
+                    // past the largest one rather than stopping.
+                    (None, Some("generate_series" | "stats_seq")) if f.tab_func && n.column.as_deref().is_some_and(|c| c.eq_ignore_ascii_case("value")) => Some(Fact::new("integer", true)),
                     (Some(sub), Some(name)) if f.cte && reads_itself(sub) => Some(self.recursive_column(name, sub, index, scope)),
                     (Some(sub), _) => Some(self.select_column(sub, index, scope)),
                     // A recursive WITH query's read of itself, inside the query: what it is taken to be.
@@ -1588,6 +1669,17 @@ impl Analyzer<'_> {
             _ => affinity_type(aff),
         };
         Fact { ty, non_null: !lone && (narrowed || ((n.not_null || n.rowid) && (!n.outer || reduced))) }
+    }
+
+    /// What libSQL's `vector_top_k` returns as `id`: the key of the row of the table its index
+    /// holds, as libSQL 0.10.0's search reads it, which is never NULL. A rowid table's rowid, an
+    /// integer, whatever its primary key; a WITHOUT ROWID table's first primary key column, as it
+    /// is stored, which is of any storage class: libSQL refuses a vector column in a STRICT table,
+    /// so a table with a vector index never is one, and the key comes back with no declared type to
+    /// name it by. `None` where the index is not written as a string or names no index.
+    fn vector_key(&self, f: &From) -> Option<Fact> {
+        let table = self.tree.tables.get(f.vector_table.as_deref()?)?;
+        Some(if table.without_rowid { Fact { ty: Ty::Unknown, non_null: true } } else { Fact::new("integer", true) })
     }
 
     // ---- expressions -------------------------------------------------------------------------
@@ -1713,6 +1805,7 @@ impl Analyzer<'_> {
                 return done(f.returns.name(), Nulls::IfArgs);
             }
         }
+        let name = sqlean_alias(name);
         if n.window {
             // A frame that always holds the current row has that row, so there `min` and `max`
             // follow their argument, as under a plain GROUP BY; `sum` and `avg` stay nullable as
@@ -1749,6 +1842,11 @@ impl Analyzer<'_> {
                 "group_concat" | "string_agg" => done("text", if grouped { Nulls::IfArgs } else { Nulls::Always }),
                 "json_group_array" | "json_group_object" => done("text", Nulls::Never),
                 "jsonb_group_array" | "jsonb_group_object" => done("blob", Nulls::Never),
+                // A percentile, SQLite's (`SQLITE_ENABLE_PERCENTILE`) or sqlean's, which Turso
+                // Cloud loads: NULL over no rows or nothing but NULLs, and an error on text.
+                "median" | "percentile" | "percentile_25" | "percentile_75" | "percentile_90" | "percentile_95" | "percentile_99" => done("real", Nulls::Always),
+                // sqlean's spread: 0.0 over no rows, NULL where the sum overflows to NaN.
+                "stddev" | "stddev_pop" | "stddev_samp" | "variance" | "var_pop" | "var_samp" => done("real", Nulls::Always),
                 _ => Fact::unknown(),
             };
         }
@@ -1816,7 +1914,10 @@ impl Analyzer<'_> {
             "strftime" => Fact::new("text", n.args.first().and_then(literal_text).is_some_and(strftime_format) && current_time(n.args.get(1..).unwrap_or_default())),
             "timediff" => Fact::new("text", n.args.len() == 2 && current_time(&n.args[..1]) && current_time(&n.args[1..])),
             // `soundex(NULL)` is '?000'.
-            "hex" | "quote" | "typeof" | "soundex" => done("text", Nulls::Never),
+            "hex" | "quote" | "typeof" => done("text", Nulls::Never),
+            // SQLite's `soundex(NULL)` is '?000', and sqlean's, which Turso Cloud loads in its
+            // place, is NULL.
+            "soundex" => done("text", Nulls::IfArgs),
             "sqlite_version" | "sqlite_source_id" | "current_date" | "current_time" | "current_timestamp" => done("text", Nulls::Never),
             "random" | "last_insert_rowid" | "changes" | "total_changes" => done("integer", Nulls::Never),
             "randomblob" | "zeroblob" => done("blob", Nulls::IfArgs),
@@ -1840,6 +1941,52 @@ impl Analyzer<'_> {
             "highlight" | "snippet" => done("text", Nulls::Always),
             "offsets" => done("text", Nulls::Never),
             "matchinfo" => done("blob", Nulls::Never),
+            // libSQL's vectors (`csrc/reylo_sqlite.c`, `openLibsql`), as libSQL 0.10.0 answers: each
+            // of these is an error on a NULL argument, never NULL. A vector is a blob, and its text
+            // is the JSON-like array `vector_extract` writes (`[1,2,3]`, `[inf]`).
+            "vector" | "vector32" | "vector64" | "vector1bit" | "vector8" | "vector16" | "vectorb16" => done("blob", Nulls::Never),
+            "vector_extract" => done("text", Nulls::Never),
+            // NULL where the distance is NaN, which SQLite stores as NULL: a zero vector's cosine,
+            // two empty vectors, infinite components.
+            "vector_distance_cos" | "vector_distance_l2" => done("real", Nulls::Always),
+            // The marker a vector index is made with returns its argument, whatever a vector column
+            // holds: a vector index takes a vector's text as well as its blob.
+            "libsql_vector_idx" => Fact { ty: Ty::Unknown, non_null: first.non_null },
+            // The sqlean extensions Turso Cloud loads (`csrc/reylo_sqlite.c`, `aTurso`), as
+            // libsql-ffi 0.10.0 builds them, each by its own name ([`sqlean_alias`]).
+            // uuid: a new identifier every call, and a malformed one read as NULL.
+            "uuid4" | "gen_random_uuid" | "uuid7" => done("text", Nulls::Never),
+            "uuid_str" => done("text", Nulls::Always),
+            "uuid_blob" => done("blob", Nulls::Always),
+            "uuid7_timestamp_ms" => done("integer", Nulls::Always),
+            // crypto: a digest of text or bytes; `encode` and `decode` NULL only for a NULL value,
+            // and an error for one they cannot read or a format they do not know.
+            "md5" | "sha1" | "sha256" | "sha384" | "sha512" | "blake3" => done("blob", Nulls::IfArgs),
+            "encode" => Fact::new("text", first.non_null),
+            "decode" => Fact::new("blob", first.non_null),
+            // fuzzy: a distance is an error on NULL and on text that is not ASCII, never NULL; a
+            // phonetic code follows its argument.
+            "levenshtein" | "dlevenshtein" | "edit_distance" | "osa_distance" | "hamming" => done("integer", Nulls::Never),
+            "jaro_winkler" => done("real", Nulls::Never),
+            "caverphone" | "phonetic_hash" | "rsoundex" => done("text", Nulls::IfArgs),
+            "translit" => done("text", Nulls::Never),
+            "script_code" => done("integer", Nulls::Never),
+            // text: NULL where a text argument is (a count or a length is an error there).
+            "bit_length" | "char_length" | "character_length" | "text_size" | "text_bitsize" | "text_length" => done("integer", Nulls::IfArgs),
+            "strpos" | "text_index" | "text_last_index" | "text_count" => done("integer", Nulls::IfArgs),
+            "starts_with" | "text_has_prefix" | "text_has_suffix" | "text_contains" | "text_like" => done("integer", Nulls::IfArgs),
+            "btrim" | "left" | "right" | "lpad" | "rpad" | "repeat" | "reverse" | "split_part" | "translate" | "text_trim" | "text_ltrim" | "text_rtrim" | "text_left" | "text_right"
+            | "text_lpad" | "text_rpad" | "text_repeat" | "text_reverse" | "text_split" | "text_translate" | "text_title" | "text_casefold" | "text_lower" | "text_upper"
+            | "text_replace" | "text_slice" | "text_substring" => done("text", Nulls::IfArgs),
+            // Like `concat` and `concat_ws`, they skip a NULL value.
+            "text_concat" => done("text", Nulls::Never),
+            "text_join" => Fact::new("text", first.non_null),
+            // regexp: a match of NULL text is 0, and a NULL pattern an error.
+            "regexp_like" => done("integer", Nulls::Never),
+            "regexp_substr" | "regexp_capture" => done("text", Nulls::Always),
+            // Where nothing matches, or the replacement is NULL, it hands back its value as it was:
+            // `regexp_replace(123, 'z', 'x')` is the integer 123.
+            "regexp_replace" => Fact { ty: if scalar_name(&first.ty) == Some("text") { first.ty.clone() } else { Ty::Unknown }, non_null: first.non_null },
             _ => Fact::unknown(),
         }
     }
@@ -1904,11 +2051,10 @@ impl Analyzer<'_> {
     fn shape_here(&self, n: &Node, scope: &ScopeStack) -> Option<Ty> {
         let name = self.builtin_name(n)?;
         let aggregate = n.agg || n.window;
-        // What a JSON function reads an argument as: a value that may be NULL is a null there,
-        // which `unknown` already admits.
+        // What a JSON function reads an argument as, and whether it may be a null there.
         let value = |x: &Node| {
             let f = self.json_fact(x, scope);
-            let nullable = !f.non_null && !admits_null(&f.ty);
+            let nullable = nullable_in_json(&f);
             (f.ty, nullable)
         };
         match name {
@@ -2413,10 +2559,21 @@ impl Analyzer<'_> {
             if let Some(on) = &f.on {
                 self.walk(on, Ctx::Bool, &inner, found);
             }
-            // `json_each` and `json_tree` read JSON text and a path (`IN (SELECT value FROM json_each(:ids))`).
+            // `json_each` and `json_tree` read JSON text and a path (`IN (SELECT value FROM json_each(:ids))`);
+            // libSQL's `vector_top_k` an index's name, a vector, as its text, and a count, which it
+            // refuses as a real or as text.
             let json = f.tab_func && matches!(f.table.as_deref(), Some("json_each" | "json_tree"));
+            let top_k = f.tab_func && f.table.as_deref() == Some("vector_top_k");
+            // sqlean's `generate_series(start, stop, step)`, integers all.
+            let series = f.tab_func && matches!(f.table.as_deref(), Some("generate_series" | "stats_seq"));
             for (i, a) in f.args.iter().enumerate() {
-                self.walk(a, if json && i < 2 { Ctx::Typed(Some(Fact::new("text", true))) } else { Ctx::None }, &inner, found);
+                let ctx = match i {
+                    0 | 1 if json || top_k => Ctx::Typed(Some(Fact::new("text", true))),
+                    2 if top_k => Ctx::Typed(Some(Fact::new("integer", true))),
+                    _ if series => Ctx::Typed(Some(Fact::new("integer", true))),
+                    _ => Ctx::None,
+                };
+                self.walk(a, ctx, &inner, found);
             }
         }
         if let Some(w) = &sel.where_ {
@@ -2626,6 +2783,7 @@ impl Analyzer<'_> {
         if !n.agg && !n.window && self.extras.function(name, n.args.len()).is_some() {
             return Ctx::None;
         }
+        let name = sqlean_alias(name);
         let text = || Ctx::Typed(Some(Fact::new("text", true)));
         let integer = || Ctx::Typed(Some(Fact::new("integer", true)));
         let real = || Ctx::Typed(Some(Fact::new("real", true)));
@@ -2670,7 +2828,28 @@ impl Analyzer<'_> {
             "highlight" if i == 1 => integer(),
             "highlight" if i > 1 => text(),
             "bm25" if i > 0 => real(),
-            _ => Ctx::None,
+            // libSQL takes a vector as its text (`'[1,2,3]'`) or its blob: a parameter is the text.
+            "vector" | "vector32" | "vector64" | "vector1bit" | "vector8" | "vector16" | "vectorb16" | "vector_extract" | "vector_distance_cos" | "vector_distance_l2" => text(),
+            // sqlean's, each alias by the name it stands for ([`sqlean_alias`]).
+            _ => match name {
+                // A count or a length after the text: `left(s, n)`, `lpad(s, n, fill)`,
+                // `split_part(s, sep, n)`, `text_slice(s, from, to)`, `regexp_capture(s, re, group)`.
+                "left" | "right" | "text_left" | "text_right" | "repeat" | "text_repeat" | "lpad" | "rpad" | "text_lpad" | "text_rpad" if i == 1 => integer(),
+                "split_part" | "text_split" | "regexp_capture" if i == 2 => integer(),
+                "text_slice" | "text_substring" if i > 0 => integer(),
+                "text_replace" if i == 3 => integer(),
+                // A value to encode is bytes; a digest takes text as well, and is given text here.
+                "encode" if i == 0 => Ctx::None,
+                "uuid_str" | "uuid_blob" | "uuid7_timestamp_ms" | "md5" | "sha1" | "sha256" | "sha384" | "sha512" | "blake3" | "encode" | "decode" | "levenshtein" | "dlevenshtein"
+                | "edit_distance" | "osa_distance" | "hamming" | "jaro_winkler" | "caverphone" | "phonetic_hash" | "rsoundex" | "translit" | "script_code" | "bit_length"
+                | "char_length" | "character_length" | "btrim" | "left" | "right" | "lpad" | "rpad" | "repeat" | "reverse" | "split_part" | "starts_with" | "strpos" | "translate"
+                | "regexp_like" | "regexp_substr" | "regexp_capture" | "regexp_replace" => text(),
+                t if t.starts_with("text_") => text(),
+                // A percentile's value and its rank, between 0 and 100.
+                "median" | "percentile" | "percentile_25" | "percentile_75" | "percentile_90" | "percentile_95" | "percentile_99" | "stddev" | "stddev_pop" | "stddev_samp" | "variance"
+                | "var_pop" | "var_samp" => real(),
+                _ => Ctx::None,
+            },
         }
     }
 
@@ -2800,7 +2979,7 @@ impl Analyzer<'_> {
     }
 
     /// The proof for one SELECT arm, its set operation aside: the closure of [`Self::determined`],
-    /// as `cardinality` proves it over libpg_query's tree. Every FROM item determined is one row
+    /// as `cardinality` proves it over Postgres's tree. Every FROM item determined is one row
     /// at most; one group at most when every GROUP BY expression is pinned; one row at most from
     /// a DISTINCT over pinned values.
     fn arm_at_most_one(&self, sel: &Sel) -> Result<(), String> {
@@ -3357,6 +3536,46 @@ fn strftime_format(format: &str) -> bool {
     true
 }
 
+/// The function a sqlean alias stands for, as the extensions Turso Cloud loads register both:
+/// `math_floor` is `floor`, `fuzzy_leven` is `levenshtein`, `stats_p90` is `percentile_90`.
+fn sqlean_alias(name: &str) -> &str {
+    match name {
+        "fuzzy_caver" => "caverphone",
+        "fuzzy_damlev" => "dlevenshtein",
+        "fuzzy_editdist" => "edit_distance",
+        "fuzzy_hamming" => "hamming",
+        "fuzzy_jarowin" => "jaro_winkler",
+        "fuzzy_leven" => "levenshtein",
+        "fuzzy_osadist" => "osa_distance",
+        "fuzzy_phonetic" => "phonetic_hash",
+        "fuzzy_rsoundex" => "rsoundex",
+        "fuzzy_script" => "script_code",
+        "fuzzy_soundex" => "soundex",
+        "fuzzy_translit" => "translit",
+        "stats_median" => "median",
+        "stats_perc" => "percentile",
+        "stats_p25" => "percentile_25",
+        "stats_p75" => "percentile_75",
+        "stats_p90" => "percentile_90",
+        "stats_p95" => "percentile_95",
+        "stats_p99" => "percentile_99",
+        "stats_stddev" => "stddev",
+        "stats_stddev_pop" => "stddev_pop",
+        "stats_stddev_samp" => "stddev_samp",
+        "stats_var" => "variance",
+        "stats_var_pop" => "var_pop",
+        "stats_var_samp" => "var_samp",
+        _ => match name.strip_prefix("crypto_").or_else(|| name.strip_prefix("math_")) {
+            Some(base @ ("md5" | "sha1" | "sha256" | "sha384" | "sha512" | "blake3" | "encode" | "decode")) if name.starts_with("crypto_") => base,
+            Some(
+                base @ ("acos" | "acosh" | "asin" | "asinh" | "atan" | "atan2" | "atanh" | "ceil" | "cos" | "cosh" | "degrees" | "exp" | "floor" | "ln" | "log" | "log10" | "log2" | "mod" | "pi"
+                | "pow" | "radians" | "round" | "sin" | "sinh" | "sqrt" | "tan" | "tanh" | "trunc"),
+            ) if name.starts_with("math_") => base,
+            _ => name,
+        },
+    }
+}
+
 /// SQLite's built-in scalar functions the engine's table reads, by name.
 const KNOWN_FUNCTIONS: &[&str] = &[
     "coalesce", "ifnull", "nullif", "iif", "if", "min", "max", "abs", "round", "length", "instr", "unicode", "json_array_length", "json_valid", "octet_length", "sign",
@@ -3558,6 +3777,51 @@ mod tests {
         assert_eq!(tables("insert into tags (post_id) select id from posts"), (names(&["posts"]), names(&["tags"])));
         assert_eq!(tables("update users set name = (select max(title) from posts) where id = 1"), (names(&["posts"]), names(&["users"])));
         assert_eq!(tables("delete from users where id in (select user_id from posts)"), (names(&["posts"]), names(&["users"])));
+    }
+
+    #[test]
+    fn a_key_declared_on_conflict_replace_is_read_from_sqlite_s_parse_however_the_ddl_spells_it() {
+        let replaces = |clause: &str| {
+            let ddl = vec![format!("create table p (id integer primary key, email text {clause})")];
+            let t = tree::analyze(&ddl, "insert into p (email) values (?1)", "insert into p (email) values (?)", &[], None).expect("the tree parses");
+            assert!(t.error.is_none(), "{clause}: {:?}", t.error);
+            t.tables["p"].replaces
+        };
+        for clause in ["unique on conflict replace", "unique on conflict\n  replace", "UNIQUE On Conflict RePlace", "unique on /* the old row goes */ conflict -- and is deleted\n replace"] {
+            assert!(replaces(clause), "{clause}");
+        }
+        // A NOT NULL's REPLACE writes the column's default, and deletes no row.
+        for clause in ["unique", "not null on conflict replace default '' unique", "unique on conflict ignore"] {
+            assert!(!replaces(clause), "{clause}");
+        }
+    }
+
+    #[test]
+    fn the_schema_replay_reaches_no_file_and_sets_no_pragma() {
+        // A row of sqlite_schema may hold more than one statement: SQLite loads the first, and the
+        // replay runs the text whole.
+        let dir = std::env::temp_dir().join(format!("reylo-sqlite-replay-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (attached, vacuumed) = (dir.join("attached.db"), dir.join("vacuumed.db"));
+        let ddl = vec![
+            format!("create table t (a integer not null); attach '{}' as x; create table x.y (z)", attached.display()),
+            format!("create table u (b); vacuum into '{}'", vacuumed.display()),
+            "create table v (c); pragma hard_heap_limit = 1; create table w (d)".to_string(),
+        ];
+        // What each row made before the refused statement is there.
+        let a = analyze_ddl("select a, b, c from t, u, v", &ddl, &Extras::default()).analysis;
+        assert!(a.diagnostics.is_empty(), "{:?}", a.diagnostics);
+        assert!(!attached.exists() && !vacuumed.exists());
+        // A refused statement ends its row's replay, which every statement that fails on what it
+        // would have made says, the replay kept from the statement before included.
+        for _ in 0..2 {
+            let refused = analyze_ddl("select d from w", &ddl, &Extras::default()).analysis;
+            let messages: Vec<&str> = refused.diagnostics.iter().map(|d| d.message.as_str()).collect();
+            assert_eq!(messages.first(), Some(&"no such table: w"), "{messages:?}");
+            assert!(messages.contains(&"The schema replay skipped statement 1: not authorized"), "{messages:?}");
+            assert!(messages.contains(&"The schema replay skipped statement 3: not authorized"), "{messages:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -3994,6 +4258,137 @@ mod tests {
         assert_eq!(kinds("select n from s union all select id from loose"), "integer");
         assert_eq!(kinds("select n from s union all select n from loose"), "union");
         assert_eq!(kinds("select n from s union all values (1)"), "union");
+    }
+
+    /// A schema as libSQL 0.10.0 writes it into `sqlite_schema` for a vector column and its
+    /// index: its own shadow tables, then the index on the marker function.
+    fn libsql_schema() -> Vec<String> {
+        [
+            "CREATE TABLE docs (id integer primary key, title text not null, emb F32_BLOB(3))",
+            "CREATE TABLE libsql_vector_meta_shadow ( name TEXT PRIMARY KEY, metadata BLOB ) WITHOUT ROWID",
+            "CREATE TABLE docs_emb_shadow (index_key  INTEGER , data BLOB, PRIMARY KEY (index_key))",
+            "CREATE INDEX docs_emb_shadow_idx ON docs_emb_shadow (index_key)",
+            "CREATE INDEX docs_emb on docs (libsql_vector_idx(emb))",
+            "CREATE TABLE words (k text primary key, e F32_BLOB(2)) WITHOUT ROWID",
+            "CREATE INDEX words_e on words (libsql_vector_idx(e, 'metric=l2'))",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    /// The SQLite that reads the file lists none of libSQL's functions, as the engine's program's does.
+    fn sqlite_host() -> Extras {
+        Extras { total: vec![], host: Some(["lower", "upper", "length", "count"].map(|name| HostFunction { name: name.into(), arity: -1, kind: 's' }).to_vec()) }
+    }
+
+    #[test]
+    fn the_sqlean_functions_turso_cloud_loads_are_typed_whatever_the_host_lists() {
+        // Measured on libSQL 0.10.0 with the sqlean extensions libsql-ffi builds.
+        let ddl = vec!["create table people (id integer primary key, name text not null, nick text, score real not null) strict".to_string()];
+        for extras in [Extras::default(), sqlite_host()] {
+            let a = |sql: &str| {
+                let a = analyze_ddl(sql, &ddl, &extras).analysis;
+                assert!(a.diagnostics.is_empty(), "{sql}: {:?}", a.diagnostics);
+                a
+            };
+            let fresh = a("select uuid4() as a, uuid7() as b, gen_random_uuid() as c, uuid_str(:id) as d, uuid_blob(:raw) as e, uuid7_timestamp_ms(:at) as f");
+            assert_eq!(["a", "b", "c", "d", "e", "f"].map(|c| col(&fresh, c)), [("text", false), ("text", false), ("text", false), ("text", true), ("blob", true), ("integer", true)].map(|(t, n)| (t.to_string(), n)));
+            assert_eq!(param(&fresh, "id"), "text");
+            let digest = a("select md5(name) as a, sha256(nick) as b, crypto_sha1(name) as c, encode(md5(name), 'hex') as d, decode(nick, 'base64') as e from people");
+            assert_eq!(["a", "b", "c", "d", "e"].map(|c| col(&digest, c)), [("blob", false), ("blob", true), ("blob", false), ("text", false), ("blob", true)].map(|(t, n)| (t.to_string(), n)));
+            let fuzzy = a("select levenshtein(name, :q) as a, fuzzy_leven(nick, :q2) as b, jaro_winkler(name, :q3) as c, caverphone(nick) as d, translit(nick) as e, script_code(name) as f from people");
+            assert_eq!(["a", "b", "c", "d", "e", "f"].map(|c| col(&fuzzy, c)), [("integer", false), ("integer", false), ("real", false), ("text", true), ("text", false), ("integer", false)].map(|(t, n)| (t.to_string(), n)));
+            assert_eq!(param(&fuzzy, "q"), "text");
+            let text = a("select left(name, :n) as a, lpad(nick, 5) as b, split_part(name, ',', 2) as c, text_title(name) as d, strpos(name, 'a') as e, char_length(nick) as f, text_concat(name, nick) as g, text_join(',', name, nick) as h from people");
+            assert_eq!(["a", "b", "c", "d", "e", "f", "g", "h"].map(|c| col(&text, c)), [("text", false), ("text", true), ("text", false), ("text", false), ("integer", false), ("integer", true), ("text", false), ("text", false)].map(|(t, n)| (t.to_string(), n)));
+            assert_eq!(param(&text, "n"), "integer");
+            // sqlean's tests answer 1 or 0.
+            let tests = a("select starts_with(name, 'a') as a, text_contains(name, :part) as b, regexp_like(nick, '^a') as c from people");
+            assert_eq!(["a", "b", "c"].map(|c| col(&tests, c)), [("bool", false), ("bool", false), ("bool", false)].map(|(t, n)| (t.to_string(), n)));
+            // `regexp_replace` hands back a value it changes nothing in as it was: an integer stays one.
+            let re = a("select regexp_substr(name, 'a+') as a, regexp_capture(name, 'b(a+)', 1) as b, regexp_replace(name, 'a', 'b') as c, regexp_replace(nick, 'a', 'b') as d, regexp_replace(id, 'z', 'x') as e from people where name regexp 'a'");
+            assert_eq!(["a", "b", "c", "d", "e"].map(|c| col(&re, c)), [("text", true), ("text", true), ("text", false), ("text", true), ("unknown", false)].map(|(t, n)| (t.to_string(), n)));
+            // An alias takes the parameter types of the function it stands for.
+            let aliased = a("select math_floor(:x) as a, fuzzy_soundex(:s) as b, stats_perc(score, :p) as c from people");
+            assert_eq!((param(&aliased, "x"), param(&aliased, "s"), param(&aliased, "p")), ("real".into(), "text".into(), "real".into()));
+            // `math_floor` is `floor`, read by SQLite's own rules, which sqlean's keep.
+            let math = a("select math_floor(score) as a, math_sqrt(score) as b, math_pi() as c from people");
+            assert_eq!(["a", "b", "c"].map(|c| col(&math, c)), [("real", false), ("real", true), ("real", false)].map(|(t, n)| (t.to_string(), n)));
+            let stats = a("select stddev(score) as a, stats_p90(score) as b, variance(score) as c from people group by name");
+            assert_eq!(["a", "b", "c"].map(|c| col(&stats, c)), [("real", true), ("real", true), ("real", true)].map(|(t, n)| (t.to_string(), n)));
+            let series = a("select value from generate_series(1, :stop)");
+            assert_eq!((col(&series, "value"), param(&series, "stop")), (("integer".to_string(), false), "integer".to_string()));
+            assert_eq!(col(&a("select value from stats_seq(1, 3)"), "value"), ("integer".to_string(), false));
+            assert!(!analyze_ddl("select value from generate_series", &ddl, &extras).analysis.diagnostics.is_empty());
+        }
+        // Names this build has of its own keep its function, typed for sqlean's too: `soundex(NULL)`
+        // is NULL on Turso Cloud, and `median` a nullable real on both.
+        let own = analyze_ddl("select soundex(nick) as a, soundex(name) as b, median(score) as c from people group by name", &ddl, &Extras::default()).analysis;
+        assert_eq!(["a", "b", "c"].map(|c| col(&own, c)), [("text", true), ("text", false), ("real", true)].map(|(t, n)| (t.to_string(), n)));
+    }
+
+    #[test]
+    fn libsql_s_vector_functions_are_typed_whatever_the_host_lists() {
+        for extras in [Extras::default(), sqlite_host()] {
+            let a = |sql: &str| {
+                let a = analyze_ddl(sql, &libsql_schema(), &extras).analysis;
+                assert!(a.diagnostics.is_empty(), "{sql}: {:?}", a.diagnostics);
+                a
+            };
+            // The schema replays, its vector index and libSQL's tables with it.
+            let plain = a("select id, title from docs where id = :id");
+            assert_eq!((col(&plain, "id"), col(&plain, "title")), (("integer".into(), false), ("text".into(), false)));
+            // A vector column outside a STRICT table, which libSQL refuses them in, holds what its BLOB affinity stores.
+            assert_eq!(a("select emb from docs").columns[0].nullable, true);
+            let distance = a("select id, vector_distance_cos(emb, vector(:q)) as d, vector_distance_l2(emb, :r) as l from docs order by d limit 5");
+            assert_eq!((col(&distance, "d"), col(&distance, "l")), (("real".into(), true), ("real".into(), true)));
+            assert_eq!((param(&distance, "q"), param(&distance, "r")), ("text".into(), "text".into()));
+            let made = a("select vector(:v) as v, vector32(:a) as a, vector64(:b) as b, vector8(:c) as c, vector16(:d) as d, vectorb16(:e) as e, vector1bit(:f) as f, vector_extract(emb) as text from docs");
+            for name in ["v", "a", "b", "c", "d", "e", "f"] {
+                assert_eq!(col(&made, name), ("blob".into(), false), "{name}");
+            }
+            assert_eq!(col(&made, "text"), ("text".into(), false));
+            let insert = a("insert into docs (title, emb) values (:title, vector(:v)) returning id");
+            assert_eq!((param(&insert, "title"), param(&insert, "v")), ("text".into(), "text".into()));
+        }
+    }
+
+    #[test]
+    fn vector_top_k_returns_the_key_of_its_index_s_table() {
+        for extras in [Extras::default(), sqlite_host()] {
+            let a = |sql: &str| {
+                let a = analyze_ddl(sql, &libsql_schema(), &extras).analysis;
+                assert!(a.diagnostics.is_empty(), "{sql}: {:?}", a.diagnostics);
+                a
+            };
+            // A rowid table's rowid.
+            let top = a("select id from vector_top_k('docs_emb', vector(:q), :k)");
+            assert_eq!(col(&top, "id"), ("integer".into(), false));
+            assert_eq!((param(&top, "q"), param(&top, "k")), ("text".into(), "integer".into()));
+            assert_eq!(a("select * from vector_top_k('docs_emb', :q, 5)").columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["id"]);
+            let joined = a("select d.id, d.title from vector_top_k('docs_emb', vector(:q), 5) as t join docs d on d.id = t.id");
+            assert_eq!(col(&joined, "title"), ("text".into(), false));
+            // A WITHOUT ROWID table's primary key, of any storage class outside a STRICT table.
+            assert_eq!(col(&a("select id from vector_top_k('words_e', :q, 3)"), "id"), ("unknown".into(), false));
+            // On the nullable side of an outer join, and from an index named some other way.
+            assert_eq!(col(&a("select t.id from docs d left join vector_top_k('docs_emb', d.emb, 1) t"), "id"), ("integer".into(), true));
+            assert_eq!(a("select id from vector_top_k(:index, :q, 5)").columns[0].nullable, true);
+        }
+    }
+
+    #[test]
+    fn libsql_s_alter_column_prepares_on_a_table_and_column_that_exist() {
+        let a = |sql: &str| analyze_ddl(sql, &libsql_schema(), &Extras::default()).analysis;
+        for sql in ["alter table docs alter column title to title text not null", "ALTER TABLE main.docs ALTER emb TO emb F32_BLOB(3) NOT NULL", "alter table \"docs\" alter column \"title\" to \"title\" text"] {
+            let altered = a(sql);
+            assert!(altered.diagnostics.is_empty(), "{sql}: {:?}", altered.diagnostics);
+            assert!(altered.columns.is_empty());
+            assert_eq!(altered.cardinality, Cardinality::None);
+        }
+        let missing = a("alter table docs alter column nope to nope integer");
+        assert!(missing.diagnostics.len() == 1 && missing.diagnostics[0].message.starts_with("no such column: \"nope\", so if it is a migration"), "{:?}", missing.diagnostics);
+        assert!(!a("alter table nope alter column title to title text").diagnostics.is_empty());
+        assert!(!a("alter table docs alter column title").diagnostics.is_empty());
     }
 
     #[test]
@@ -5011,18 +5406,28 @@ mod tests {
             "lag(json_array(id)) over (order by id)",
             "max(json_array(id), json_array(0))",
             "cast(json_array(id) as text)",
-            "json(doc)",
-            "json_extract(doc, '$.a')",
-            "doc -> '$.a'",
             "doc ->> '$.a'",
-            "json_set(doc, '$.a', 1)",
-            "json_quote(name)",
             "json_pretty(json_array(1))",
             "case when id > 1 then json_array(id) else 'x' end",
             "case when id > 1 then json_array(id) else json_object('a', 1) end",
         ] {
             let sql = format!("select json_object('a', {expr}) as o from (select *, json_array(id) as x from users) users, (select post from titled)");
             assert_eq!(json_typed(&sql), "o: { a: unknown }", "{expr}");
+        }
+        // Any JSON a function returns, which may be the document `null` itself, however NOT NULL
+        // the value it reads (`json(doc)` where `doc` holds `'null'`): a null there too.
+        for expr in ["json(doc)", "json_extract(doc, '$.a')", "doc -> '$.a'", "json_set(doc, '$.a', 1)", "json_quote(name)"] {
+            assert_eq!(json_typed(&format!("select json_object('a', {expr}) as o from users")), "o: { a: unknown | null }", "{expr}");
+        }
+        let not_null = vec!["create table js (id integer primary key, doc text not null check (json_valid(doc)), b blob not null check (json_valid(b, 8)))".to_string()];
+        for (expr, ty) in [
+            ("json_object('k', json(doc))", "{ k: unknown | null }"),
+            ("json_object('k', doc -> '$')", "{ k: unknown | null }"),
+            ("json_object('k', json_extract(doc, '$'))", "{ k: unknown | null }"),
+            ("json_object('k', json(b))", "{ k: unknown | null }"),
+            ("json_group_array(json(doc))", "(unknown | null)[]"),
+        ] {
+            assert_eq!(shown(&analyze_ddl(&format!("select {expr} as o from js"), &not_null, &Extras::default()).analysis), format!("o: {ty}"), "{expr}");
         }
         // A function the host registers over a built-in is its own, and may set the subtype.
         let host = Extras { total: vec![TotalFunction { name: "json_array".into(), arity: -1, returns: Affinity::Text }, TotalFunction { name: "html".into(), arity: 1, returns: Affinity::Text }], host: None };

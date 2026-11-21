@@ -22,7 +22,8 @@ const [packsArg, platform] = process.argv.slice(2);
 if (!packsArg || !platform) throw new Error("usage: node .github/scripts/install-check.ts <packs> <platform>");
 const packs = resolve(packsArg);
 const VERDACCIO = "6.11.1";
-const PORT = 48731;
+// Below every platform's ephemeral range, which an outgoing connection can take the port from.
+const PORT = 28731;
 const registry = `http://127.0.0.1:${PORT}/`;
 const windows = process.platform === "win32";
 
@@ -113,7 +114,7 @@ try {
   console.log(analyzed);
   // The result is a table, of at most one row where the key is pinned.
   const descriptor = JSON.parse(analyzed) as { file?: string; result?: { cardinality?: string; columns: { name: string }[] } };
-  if (descriptor.file !== "user.sql" || descriptor.result?.columns.map((c) => c.name).join() !== "id,name" || descriptor.result?.cardinality !== "at_most_one") throw new Error("reylo analyze did not type user.sql");
+  if (descriptor.file !== undefined || descriptor.result?.columns.map((c) => c.name).join() !== "id,name" || descriptor.result?.cardinality !== "at_most_one") throw new Error("reylo analyze did not type user.sql");
   // The playground's server, which the launcher runs in JavaScript.
   if (!run(command, ["play", "--help"], { cwd: project }).startsWith("Usage: reylo play")) throw new Error("reylo play --help printed no usage");
   const ran = run(process.execPath, ["--import", "reylo/register", "main.ts"], { cwd: project, env }).trim();

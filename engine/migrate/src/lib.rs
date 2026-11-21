@@ -6,10 +6,11 @@
 //! history row, so a file that cannot (a statement that cannot run in a transaction beside others;
 //! MySQL's DDL beside anything) is refused.
 //!
-//! Postgres, MySQL and SQLite. The commands are in `commands`; the comparator is `catalog`; the
+//! Postgres, MySQL and SQLite, a libSQL server's (Turso's) among SQLite's (`libsql`). The commands are in `commands`; the comparator is `catalog`; the
 //! lexer that splits and classifies statements is `sql`; the connections and shadows are `db`; the
 //! replays the shadows run are `replay`, which the cache of what they reached (`cache`) shortens;
-//! `lock` is the project's lock file.
+//! `lock` is the project's lock file; `terminal` is the spinner and the SQL's colours an interactive
+//! terminal shows.
 //!
 //! The `cli` feature (on by default) builds every command, with the connections and shadows they
 //! open. Without it, only `reylo migrate deploy` and `reylo migrate status` are built, each run on a
@@ -25,10 +26,16 @@ pub mod commands;
 pub mod db;
 #[cfg(feature = "cli")]
 pub mod diff;
+pub mod libsql;
+#[cfg(feature = "cli")]
+pub mod libsql_local;
 pub mod lock;
+#[cfg(feature = "cli")]
+pub mod locks;
 #[cfg(feature = "cli")]
 mod replay;
 pub mod sql;
+pub mod terminal;
 mod time;
 
 #[cfg(feature = "cli")]
@@ -69,6 +76,8 @@ impl Dialect {
             "postgres" | "postgresql" => Ok(Dialect::Postgres),
             "mysql" | "mariadb" => Ok(Dialect::Mysql),
             "sqlite" | "file" => Ok(Dialect::Sqlite),
+            // A libSQL server's database, Turso Cloud's among them, named as `@libsql/client` names it.
+            "libsql" | "https" | "http" | "wss" | "ws" => Ok(Dialect::Sqlite),
             // A bare path, or one on a Windows drive (`C:\app.db`): any other scheme names a database Reylo doesn't read.
             _ if scheme.len() <= 1 && (lower == ":memory:" || [".db", ".sqlite", ".sqlite3"].iter().any(|e| lower.ends_with(e))) => Ok(Dialect::Sqlite),
             _ => Err(Error(format!("no database for the URL's scheme: {}", redact(url)))),
@@ -129,6 +138,7 @@ mod tests {
         assert_eq!(Dialect::of_url("./dev.db").unwrap(), Dialect::Sqlite);
         assert_eq!(Dialect::of_url("C:\\app.db").unwrap(), Dialect::Sqlite);
         assert_eq!(Dialect::of_url(":memory:").unwrap(), Dialect::Sqlite);
+        assert_eq!(Dialect::of_url("libsql://app-acme.turso.io").unwrap(), Dialect::Sqlite);
         assert!(Dialect::of_url("duckdb:./app.db").is_err());
         assert_eq!(percent_decode("a%20b%2"), "a b%2");
         assert_eq!(redact("postgres://u:p@h/db"), "postgres://…@h/db");

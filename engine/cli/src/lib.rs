@@ -25,6 +25,7 @@
 //! runs it.
 
 mod analyze;
+mod lsp;
 mod matched;
 mod yaml;
 
@@ -42,7 +43,6 @@ const USAGE: &str = "Usage: reylo <command>
           [paths] [--out]   of #[reylo::query] (reylo generate --help)
   migrate <command>         Write, check and run migrations, and repair their history
   db <command>              Push schema.sql to a development database, reset, wipe or read it
-                            (reylo migrate --help lists both groups' commands)
   run \"<sql>\"… [--file <path>]…
                             Run SQL on the database as written; records nothing
   play [--port] [--no-open] Serve the playground on 127.0.0.1, against the project's database
@@ -74,29 +74,39 @@ Runs SQL on the database as written, outside any migration's history: inline tex
 --file names (-f), in the order given. The database is the type check's connection; --url names
 another.";
 
-const MIGRATE_USAGE: &str = "Usage: reylo <group> <command> [flags]
+const MIGRATE_USAGE: &str = "Usage: reylo migrate <command> [flags]
 
 Commands:
-  migrate init             Start from this database
+  init                     Start from this database
     --schema <name>        A schema to read (Postgres; public by default)
-  migrate new <name>       Write the next migration, from schema.sql or this database
+  new <name>               Write the next migration, from schema.sql or this database
     --drop <names>         Accept what it drops: tables and columns
     --rename <old>=<new>   Say a table or column was renamed
-  migrate dev              Take this database to the migrations, and lock them
-  migrate deploy           Run what the lock lists, with no shadow database
+    --blocking             Accept a statement that blocks writes while it reads every row
+  dev                      Take this database to the migrations, and lock them
+  deploy                   Run what the lock lists, with no shadow database
     --dry-run              Try it on a shadow database, running nothing here
-  migrate status           Check that this database and the files are in step
-  migrate lock             Write the lock from this database's history
-  migrate history push     Record the migrations this database's schema has
-  migrate history pull     Write the migrations this database ran into files
-  db push                  Take this database to schema.sql, unrecorded
+  status                   Check that this database and the files are in step
+  lock                     Write the lock from this database's history
+  history push             Record the migrations this database's schema has
+  history pull             Write the migrations this database ran into files
+
+Flags:
+  --url <url>              The database, in place of direct_url
+  --json                   Print the result as one JSON object
+  -h, --help               Print this help";
+
+const DB_USAGE: &str = "Usage: reylo db <command> [flags]
+
+Commands:
+  push                     Take this database to schema.sql, unrecorded
     --drop <names>         Accept what it drops: tables and columns
     --rename <old>=<new>   Say a table or column was renamed
     --force                Accept everything it drops
     --watch                Push again on each save
-  db reset                 Rebuild this database from the migrations
-  db wipe                  Delete every row, keeping the schema
-  db introspect            Print this database's schema as SQL
+  reset                    Rebuild this database from the migrations
+  wipe                     Delete every row, keeping the schema
+  introspect               Print this database's schema as SQL
     --schema <name>        A schema to read (Postgres; public by default)
 
 Flags:
@@ -104,18 +114,27 @@ Flags:
   --json                   Print the result as one JSON object
   -h, --help               Print this help";
 
+/// A group's help: `reylo migrate`'s or `reylo db`'s.
+fn usage(group: &str) -> &'static str {
+    if group == "db" {
+        DB_USAGE
+    } else {
+        MIGRATE_USAGE
+    }
+}
+
 /// Every command of those groups, as it's typed.
 const COMMANDS: [&str; 12] = ["migrate init", "migrate new", "migrate dev", "migrate deploy", "migrate status", "migrate lock", "migrate history push", "migrate history pull", "db push", "db reset", "db wipe", "db introspect"];
 
 /// Names another tool gives these commands, and the one each is here.
 const ALSO_KNOWN_AS: [(&str, &str); 3] = [("create", "migrate new"), ("generate", "migrate new"), ("pull", "db introspect")];
 
-/// The help as a terminal shows it: its headings bold, each command cyan, each flag yellow and what
-/// it takes dim. Piped, it is the text alone.
-fn painted_usage() -> String {
+/// A group's help as a terminal shows it: its headings bold, each command cyan, each flag yellow and
+/// what it takes dim. Piped, it is the text alone.
+fn painted_usage(group: &str) -> String {
     use reylo_migrate::commands::paint;
     let name = regex::Regex::new(r"^(\s+)(--?[a-z-]+(?:, --[a-z-]+)?|[a-z][a-z -]*?)( <\S+)?(\s{2}.*)$").unwrap();
-    let lines = MIGRATE_USAGE.lines().map(|line| {
+    let lines = usage(group).lines().map(|line| {
         if let Some(rest) = line.strip_prefix("Usage: ") {
             return format!("{} {rest}", paint("bold", "Usage:"));
         }
@@ -216,8 +235,9 @@ fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime")
 }
 
+/// A command's line on stdout, clear of the spinner's.
 fn print(line: &str) {
-    println!("{line}");
+    reylo_migrate::terminal::println(line);
 }
 
 /// A command that isn't one, said on stderr with exit 2; with `--json`, as the one JSON object every
@@ -250,7 +270,7 @@ fn group_command(group: &str, args: &[String]) -> Result<i32, String> {
 
 fn group_command_checked(group: &str, args: &[String]) -> Result<i32, String> {
     if args.is_empty() || args[0] == "help" || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
-        println!("{}", painted_usage());
+        println!("{}", painted_usage(group));
         return Ok(0);
     }
     // The words that name the command: `migrate history` takes one more.
@@ -283,6 +303,7 @@ fn group_command_checked(group: &str, args: &[String]) -> Result<i32, String> {
     let takes: &[&str] = match command {
         "db push" => &["watch", "force"],
         "migrate deploy" => &["dry-run"],
+        "migrate new" => &["blocking"],
         _ => &[],
     };
     let short = args[..words].join(" ");
@@ -322,6 +343,7 @@ fn group_command_checked(group: &str, args: &[String]) -> Result<i32, String> {
     // With --json, one JSON object on stdout: whether it succeeded, each refusal with its code, what
     // the command found (status's rows), and every line it would have printed, plain.
     reylo_migrate::commands::set_color(false);
+    reylo_migrate::terminal::set_spinner(false);
     reylo_migrate::commands::set_json(true);
     let mut lines: Vec<String> = Vec::new();
     let mut sql = None;
@@ -357,6 +379,12 @@ fn group_command_checked(group: &str, args: &[String]) -> Result<i32, String> {
 fn run_group(command: &str, parsed: &Args, log: reylo_migrate::commands::Log<'_>, sql: &mut Option<String>) -> Result<i32, String> {
     let has = |s: &str| parsed.switches.iter().any(|x| x == s);
     let opts = settings(parsed)?;
+    // A run holds a session, which a transaction pooler shares out; `reylo run` holds none.
+    for (url, key) in std::iter::once((&opts.url, "direct_url")).chain(opts.shadow_url.as_ref().map(|u| (u, "shadow_url"))) {
+        if let Some(refusal) = reylo_migrate::db::transaction_pooler(url, key) {
+            return Err(refusal);
+        }
+    }
     // The home directory is no project's (project.rs), so nothing makes one there.
     if matches!(command, "migrate init" | "migrate history pull") && project::is_home(&opts.root, &environment()) {
         return Err(format!("{} won't write into your home directory: run it in your project's directory", command.trim_start_matches("migrate ")));
@@ -374,7 +402,7 @@ fn run_group(command: &str, parsed: &Args, log: reylo_migrate::commands::Log<'_>
         match command {
             "migrate init" => reylo_migrate::init(&opts, &parsed.schemas, &mut log).await,
             "migrate new" => {
-                let choices = reylo_migrate::Choices { drop: parsed.drops.clone(), rename: parsed.renames.clone() };
+                let choices = reylo_migrate::Choices { drop: parsed.drops.clone(), rename: parsed.renames.clone(), blocking: has("blocking") };
                 reylo_migrate::create(&opts, parsed.rest.first().map(String::as_str).unwrap_or_default(), &choices, &mut log).await
             }
             "migrate history push" => reylo_migrate::history_push(&opts, &mut log).await,
@@ -385,15 +413,16 @@ fn run_group(command: &str, parsed: &Args, log: reylo_migrate::commands::Log<'_>
             "migrate deploy" if has("dry-run") => reylo_migrate::dry_run(&opts, &mut log).await,
             "migrate deploy" => reylo_migrate::deploy(&opts, &mut log).await,
             "db push" => {
-                let push = reylo_migrate::Push { choices: reylo_migrate::Choices { drop: parsed.drops.clone(), rename: parsed.renames.clone() }, force: has("force") };
+                let push = reylo_migrate::Push { choices: reylo_migrate::Choices { drop: parsed.drops.clone(), rename: parsed.renames.clone(), ..Default::default() }, force: has("force") };
                 if has("watch") {
                     reylo_migrate::db_push_watch(&opts, in_ci, &push, None, &mut log).await
                 } else {
                     reylo_migrate::db_push(&opts, in_ci, &push, &mut log).await
                 }
             }
+            // Coloured only where stdout is a terminal, so never with --json.
             "db introspect" => reylo_migrate::db_introspect(&opts, &parsed.schemas).await.map(|text| {
-                *sql = Some(text);
+                *sql = Some(reylo_migrate::terminal::highlight(&text, reylo_migrate::Dialect::of_url(&opts.url).unwrap_or(reylo_migrate::Dialect::Postgres)));
                 0
             }),
             "db reset" => reylo_migrate::db_reset(&opts, in_ci, &mut log).await,
@@ -481,7 +510,7 @@ fn run_command(args: &[String]) -> Result<i32, String> {
         return Ok(2);
     }
     let mut log = print;
-    runtime().block_on(reylo_migrate::run_sql(&opts.url, &opts.root, &items, &mut log)).map_err(|e| e.0)
+    runtime().block_on(reylo_migrate::run_sql(&opts, &items, &mut log)).map_err(|e| e.0)
 }
 
 fn engine_command(args: &[String]) -> i32 {
@@ -507,6 +536,9 @@ pub fn main() {
         std::process::exit(code);
     }
     reylo_migrate::commands::set_color(std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none());
+    // A spinner repaints its line on stderr, so it needs a terminal there that can, and none at all
+    // where stdout goes elsewhere: a redirect or a pipe takes the output alone, as it always was.
+    reylo_migrate::terminal::set_spinner(std::io::stdout().is_terminal() && std::io::stderr().is_terminal() && std::env::var("TERM").map_or(true, |t| t != "dumb"));
     let code = match args.first().map(String::as_str) {
         None | Some("--help" | "-h" | "help") => {
             println!("{USAGE}");
@@ -517,6 +549,7 @@ pub fn main() {
             0
         }
         Some("analyze") => analyze::run(&args[1..]),
+        Some("lsp") => lsp::run(&args[1..]),
         Some("engine") => engine_command(&args[1..]),
         Some("play") => {
             eprintln!("reylo play runs from reylo's npm package, which renders the playground's TypeScript: npx reylo play");
@@ -541,17 +574,23 @@ pub fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{painted_usage, COMMANDS, MIGRATE_USAGE};
+    use super::{painted_usage, usage, COMMANDS};
 
     #[test]
     fn the_help_is_its_text_when_nothing_paints_it() {
-        assert_eq!(painted_usage(), MIGRATE_USAGE);
+        for group in ["migrate", "db"] {
+            assert_eq!(painted_usage(group), usage(group));
+        }
     }
 
     #[test]
-    fn the_help_lists_every_command() {
+    fn each_group_lists_its_own_commands() {
         for command in COMMANDS {
-            assert!(MIGRATE_USAGE.contains(&format!("  {command}  ")) || MIGRATE_USAGE.contains(&format!("  {command} <")), "{command}");
+            let (group, name) = command.split_once(' ').unwrap();
+            let help = usage(group);
+            assert!(help.contains(&format!("  {name}  ")) || help.contains(&format!("  {name} <")), "{command}");
+            let other = usage(if group == "db" { "migrate" } else { "db" });
+            assert!(!other.contains(&format!("  {name}  ")) && !other.contains(&format!("  {name} <")), "{command} is in the other group's help");
         }
     }
 }

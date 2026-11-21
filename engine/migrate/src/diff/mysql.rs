@@ -259,6 +259,12 @@ impl Column {
         if table_collation == Some(c.collation.as_str()) {
             c.collation.clear();
         }
+        // MySQL shows a nullable AUTO_INCREMENT column without its NULL, and makes one written so
+        // NOT NULL.
+        let words: Vec<&str> = c.rest.split_whitespace().collect();
+        if words.contains(&"auto_increment") && !words.windows(2).any(|w| w == ["not", "null"]) && !words.contains(&"null") {
+            c.rest = format!("null {}", c.rest);
+        }
         format!("{} {}", self.q, c.def())
     }
 }
@@ -274,6 +280,9 @@ struct Body {
     /// Indexes and checks, each `(name, name as written, definition)`.
     indexes: Vec<(String, String, String)>,
     checks: Vec<(String, String, String)>,
+    /// Its next AUTO_INCREMENT value: no part of its definition, which follows the rows, but the
+    /// start a new table is made with.
+    counter: Option<String>,
 }
 
 impl Body {
@@ -300,6 +309,7 @@ impl Body {
             columns: v["columns"].as_array().into_iter().flatten().map(|c| Column { name: s(&c[0]), q: s(&c[1]), ty: s(&c[2]), collation: s(&c[3]), rest: s(&c[4]) }).collect(),
             indexes: triples(&v["indexes"]),
             checks: triples(&v["checks"]),
+            counter: None,
         })
     }
 
@@ -354,7 +364,7 @@ async fn read_objects(db: &mut Db) -> Result<Schema, Error> {
     let mut checks: BTreeMap<(String, String), String> = BTreeMap::new();
     for r in db
         .rows(
-            "select tc.table_name as t, tc.constraint_name as n, cc.check_clause as clause, tc.enforced
+            "select tc.table_name as t, tc.constraint_name as n, cc.check_clause as clause, tc.enforced as enforced
             from information_schema.table_constraints tc join information_schema.check_constraints cc
               on cc.constraint_schema = tc.constraint_schema and cc.constraint_name = tc.constraint_name
             where tc.table_schema = database() and tc.constraint_type = 'CHECK'",
@@ -557,7 +567,7 @@ async fn read_objects(db: &mut Db) -> Result<Schema, Error> {
     }
 
     // Routines: functions and procedures, each in a namespace of its own.
-    for r in db.rows("select routine_name as n, routine_type as type, routine_definition as body, definer from information_schema.routines where routine_schema = database() order by routine_name").await? {
+    for r in db.rows("select routine_name as n, routine_type as type, routine_definition as body, definer as definer from information_schema.routines where routine_schema = database() order by routine_name").await? {
         let (name, word) = (r.text("n"), r.text("type").to_ascii_lowercase());
         let q = ctx.ident(name);
         let column = if word == "function" { "Create Function" } else { "Create Procedure" };
@@ -569,7 +579,7 @@ async fn read_objects(db: &mut Db) -> Result<Schema, Error> {
         s.add(Object {
             id: format!("{word} {name}"),
             kind: Some(Kind::Function),
-            def: format!("{head}\n{body}\n-- definer {}", r.text("definer")),
+            def: format!("{head}\n{body}\n-- {}", ctx.definer(r.text("definer"))),
             create: vec![create],
             drop: vec![format!("drop {word} {q}")],
             change: Change::Alter { blocks: false },
@@ -580,7 +590,7 @@ async fn read_objects(db: &mut Db) -> Result<Schema, Error> {
     // Triggers, in their order on their table: each after the one before it, which it follows.
     let triggers = db
         .rows(&format!(
-            "select trigger_name as n, event_manipulation as ev, event_object_table as t, action_statement as body, action_timing as timing, action_order as ord, definer
+            "select trigger_name as n, event_manipulation as ev, event_object_table as t, action_statement as body, action_timing as timing, action_order as ord, definer as definer
             from information_schema.triggers where trigger_schema = database() and event_object_table <> '{history}' order by event_object_table, action_timing, event_manipulation, action_order"
         ))
         .await?;
@@ -595,7 +605,7 @@ async fn read_objects(db: &mut Db) -> Result<Schema, Error> {
             id: format!("trigger {name}"),
             kind: Some(Kind::Trigger),
             owner: Some(format!("table {}", r.text("t"))),
-            def: format!("{head}{body}\n-- definer {}", r.text("definer")),
+            def: format!("{head}{body}\n-- {}", ctx.definer(r.text("definer"))),
             create: vec![format!("create {}trigger {q} {head}{body}", ctx.definer(r.text("definer")))],
             drop: vec![format!("drop trigger {q}")],
             deps: before.map(|p| format!("trigger {}", p.text("n"))).into_iter().collect(),
@@ -609,7 +619,7 @@ async fn read_objects(db: &mut Db) -> Result<Schema, Error> {
     // one-time event runs, for the same reason.
     for r in db
         .rows(
-            "select event_name as n, definer, event_definition as body, event_type as type, interval_value as iv, interval_field as field, ends, status, on_completion as oc, event_comment as comment,
+            "select event_name as n, definer as definer, event_definition as body, event_type as type, interval_value as iv, interval_field as field, ends as ends, status as status, on_completion as oc, event_comment as comment,
               starts = created as now
             from information_schema.events where event_schema = database() order by event_name",
         )
@@ -621,7 +631,7 @@ async fn read_objects(db: &mut Db) -> Result<Schema, Error> {
         let (head, body) = split_body(&ctx, &text, r.text("body"));
         let head = without_defaults(&head, r.flag("now"));
         let def = format!(
-            "{} every {} {} ends {} {} {} comment {}\n{body}\n-- definer {}",
+            "{} every {} {} ends {} {} {} comment {}\n{body}\n-- {}",
             r.text("type"),
             r.text("iv"),
             r.text("field"),
@@ -629,7 +639,7 @@ async fn read_objects(db: &mut Db) -> Result<Schema, Error> {
             r.text("status"),
             r.text("oc"),
             r.text("comment"),
-            r.text("definer")
+            ctx.definer(r.text("definer"))
         );
         s.add(Object {
             id: format!("event {name}"),
@@ -638,6 +648,31 @@ async fn read_objects(db: &mut Db) -> Result<Schema, Error> {
             create: vec![format!("{} {body}", head.replacen("create ", &format!("create {}", ctx.definer(r.text("definer"))), 1))],
             drop: vec![format!("drop event {q}")],
             change: Change::Alter { blocks: false },
+            ..Object::default()
+        });
+    }
+
+    // Privileges on the tables, views, columns and routines. MySQL keeps one after what it is on is
+    // dropped or renamed, so it is no part of that object and goes with nothing: it is revoked
+    // before a drop and granted after a create.
+    let grants = crate::catalog::mysql_grants(db).await?;
+    s.grants_unread = grants.is_none();
+    for g in grants.unwrap_or_default() {
+        let on = match g.kind {
+            "table" if views.contains(&g.name) => format!("view {}", g.name),
+            "table" => format!("table {}", g.name),
+            kind => format!("{kind} {}", g.name),
+        };
+        let at = g.column.as_ref().map(|c| format!("column {}.{c}", g.name)).unwrap_or_else(|| on.clone());
+        let column = g.column.as_ref().map(|c| format!(" ({c})")).unwrap_or_default();
+        let ident = |name: &str| ctx.ident(name);
+        s.add(Object {
+            // By what it is on and to whom first, so that a plan writes those of one statement together.
+            id: format!("grant on {on} to {}: {}{column}", g.account(), g.privilege),
+            kind: Some(Kind::Grant),
+            create: vec![g.statement(&ident, true)],
+            drop: vec![g.statement(&ident, false)],
+            deps: s.objects.contains_key(&at).then_some(at).into_iter().collect(),
             ..Object::default()
         });
     }
@@ -846,6 +881,11 @@ fn parse_table(ctx: &Ctx, text: &str, table: &str, infos: &BTreeMap<(String, Str
             }
         }
     }
+    // MySQL keeps an expression as it was written, and a column's name in another case is the same
+    // column: each is written as the table names it.
+    for (_, _, def) in body.indexes.iter_mut().filter(|(_, _, d)| d.contains("((")) {
+        *def = columns_as_named(def, &body.columns, &ctx.reserved);
+    }
     // In name order, the primary key first, so that two tables of the same indexes have one body
     // whatever order they were made in.
     body.indexes.sort_by(|a, b| (a.0 != "PRIMARY", &a.0).cmp(&(b.0 != "PRIMARY", &b.0)));
@@ -855,7 +895,7 @@ fn parse_table(ctx: &Ctx, text: &str, table: &str, infos: &BTreeMap<(String, Str
     let mut k = 0;
     while k < tokens.len() {
         if tokens[k].upper() == "PARTITION" && tokens.get(k + 1).is_some_and(|t| t.upper() == "BY") {
-            body.partition = ctx.tidy(&close[tokens[k].start..], TABLE_TEXT);
+            body.partition = columns_as_named(&ctx.tidy(&close[tokens[k].start..], TABLE_TEXT), &body.columns, &ctx.reserved);
             break;
         }
         // `KEY=VALUE`, where the key may be two words (`DEFAULT CHARSET`) and the value a list.
@@ -887,7 +927,12 @@ fn parse_table(ctx: &Ctx, text: &str, table: &str, infos: &BTreeMap<(String, Str
         k += 1;
         let key = key.into_iter().filter(|w| w != "DEFAULT").collect::<Vec<_>>().join(" ").to_ascii_lowercase();
         let key = if key == "character set" { "charset".to_string() } else { key };
-        if !key.is_empty() && key != "auto_increment" {
+        // A table in a file of its own, as one with no tablespace is where `innodb_file_per_table` is
+        // on: no statement takes the clause away once written.
+        let own_file = key == "tablespace" && close[start..end].trim_matches('`').eq_ignore_ascii_case("innodb_file_per_table");
+        if key == "auto_increment" {
+            body.counter = Some(close[start..end].to_string());
+        } else if !key.is_empty() && !own_file {
             body.options.push((key, close[start..end].to_string()));
         }
     }
@@ -945,6 +990,9 @@ fn create_table(ctx: &Ctx, body: &Body) -> String {
         if !skip {
             out += &format!(" {key}={value}");
         }
+    }
+    if let Some(counter) = &body.counter {
+        out += &format!(" auto_increment={counter}");
     }
     if !body.partition.is_empty() {
         out += &format!("\n{}", body.partition);
@@ -1061,23 +1109,65 @@ fn renamed_parts(text: &str, map: &BTreeMap<String, String>) -> String {
 
 /// The statements that take a table from one body to the other: one `alter table` with a clause
 /// per change, and the change of its partitioning, which MySQL takes only as a statement of its own.
+/// An index's definition without its block size and full-text parser.
+fn without_index_options(def: &str) -> String {
+    static OPTIONS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i) (key_block_size\s*=\s*\d+|with parser `[^`]+`|with parser \w+)").expect("a valid pattern"));
+    OPTIONS.replace_all(def, "").into_owned()
+}
+
 fn alter_table(from: &Body, to: &Body, pairs: &[(String, String)], made: &BTreeSet<String>) -> Vec<String> {
     let pairs = pairs.to_vec();
     let map: BTreeMap<String, String> = pairs.iter().map(|(old, new)| (old.clone(), to.column(new).map(|c| c.q.clone()).unwrap_or_default())).collect();
     let old_of: BTreeMap<&str, &str> = pairs.iter().map(|(o, n)| (n.as_str(), o.as_str())).collect();
     let mut clauses = Vec::new();
 
+    // A column made or unmade virtual, or moved between virtual and stored, which MySQL won't
+    // modify, is dropped and added again in the statement: a virtual column's values are computed,
+    // and a column made virtual has its values computed from then on. A generated column reading
+    // it goes and comes back after it, since one can read only those defined before it, and so do
+    // the checks and indexes reading either, which hold the drop back.
+    let remade = |was: &Column, now: &Column| was.generation() != now.generation() && (was.generation() == Some("virtual") || now.generation() == Some("virtual"));
+    let kept = |c: &Column| from.column(&c.name).filter(|_| !old_of.contains_key(c.name.as_str()));
+    let mut remade_columns: BTreeSet<String> = to.columns.iter().filter(|c| kept(c).is_some_and(|was| remade(was, c))).map(|c| c.name.clone()).collect();
+    loop {
+        let more: Vec<String> = to.columns.iter().filter(|c| !remade_columns.contains(&c.name) && c.generation().is_some() && kept(c).is_some() && remade_columns.iter().any(|r| reads(&c.rest, r))).map(|c| c.name.clone()).collect();
+        if more.is_empty() {
+            break;
+        }
+        remade_columns.extend(more);
+    }
+    // A column whose spatial reference changes, which MySQL won't change under a spatial index.
+    let srid = |c: &Column| c.rest.split_whitespace().skip_while(|w| *w != "srid").nth(1).map(String::from);
+    let resrid: BTreeSet<String> = to.columns.iter().filter(|c| kept(c).is_some_and(|was| srid(was) != srid(c))).map(|c| c.name.clone()).collect();
+    let checks_on = |def: &str| remade_columns.iter().any(|r| reads(def, r));
+    let indexes_on = |def: &str| remade_columns.iter().chain(&resrid).any(|r| reads(def, r));
+    // A spatial index goes in a statement before the one that changes its column's reference,
+    // which MySQL refuses while the index stands, even in the same statement.
+    let mut first: Vec<String> = Vec::new();
+
     // A check that reads a renamed column is dropped and added again in the same statement, which
     // MySQL requires; an index on one follows the column by itself.
     for (name, q, def) in &from.checks {
-        if to.checks.iter().find(|(n, _, _)| n == name).is_none_or(|(_, _, d)| d != def) {
+        if to.checks.iter().find(|(n, _, _)| n == name).is_none_or(|(_, _, d)| d != def) || checks_on(def) {
             clauses.push(format!("drop check {q}"));
         }
     }
     let plain = |def: &str| !def.contains("((");
     let index_now = |def: &str| if plain(def) { renamed_parts(def, &map) } else { def.to_string() };
+    // An index made visible or invisible, and nothing else, changes in place.
+    let seen_only = |a: &str, b: &str| a != b && unseen(a).0 == unseen(b).0;
     for (name, q, def) in &from.indexes {
-        if to.indexes.iter().find(|(n, _, _)| n == name).is_none_or(|(_, _, d)| *d != index_now(def)) {
+        let now = to.indexes.iter().find(|(n, _, _)| n == name);
+        if let Some((_, _, d)) = now.filter(|(_, _, d)| seen_only(&index_now(def), d) && !indexes_on(def)) {
+            clauses.push(format!("alter index {q} {}", if d.ends_with(" invisible") { "invisible" } else { "visible" }));
+            continue;
+        }
+        // One whose block size or full-text parser alone changes goes in a statement before:
+        // dropped and added again in one, MySQL takes it as the same index and keeps it as it was.
+        let options_alone = now.is_some_and(|(_, _, d)| *d != index_now(def) && without_index_options(d) == without_index_options(&index_now(def)));
+        if (resrid.iter().any(|r| reads(def, r)) || options_alone) && name != "PRIMARY" {
+            first.push(format!("drop index {q}"));
+        } else if now.is_none_or(|(_, _, d)| *d != index_now(def)) || indexes_on(def) {
             clauses.push(if name == "PRIMARY" { "drop primary key".to_string() } else { format!("drop index {q}") });
         }
     }
@@ -1086,12 +1176,8 @@ fn alter_table(from: &Body, to: &Body, pairs: &[(String, String)], made: &BTreeS
             clauses.push(format!("drop column {}", c.q));
         }
     }
-    // A column made or unmade virtual, or moved between virtual and stored, which MySQL won't
-    // modify, is dropped and added again in the statement: a virtual column's values are computed,
-    // and a column made virtual has its values computed from then on.
-    let remade = |was: &Column, now: &Column| was.generation() != now.generation() && (was.generation() == Some("virtual") || now.generation() == Some("virtual"));
     for c in &to.columns {
-        if let Some(was) = from.column(&c.name).filter(|was| !old_of.contains_key(c.name.as_str()) && remade(was, c)) {
+        if let Some(was) = kept(c).filter(|_| remade_columns.contains(&c.name)) {
             clauses.push(format!("drop column {}", was.q));
         }
     }
@@ -1109,8 +1195,8 @@ fn alter_table(from: &Body, to: &Body, pairs: &[(String, String)], made: &BTreeS
     }
     for c in &to.columns {
         match from.column(old_of.get(c.name.as_str()).copied().unwrap_or(&c.name)) {
+            Some(_) if !old_of.contains_key(c.name.as_str()) && remade_columns.contains(&c.name) => clauses.push(format!("add column {}", c.written(collation))),
             Some(was) if old_of.contains_key(c.name.as_str()) || was.def() == c.def() => {}
-            Some(was) if remade(was, c) => clauses.push(format!("add column {}", c.written(collation))),
             Some(_) => clauses.push(format!("modify column {}", c.written(collation))),
             None => clauses.push(format!("add column {}", c.written(collation))),
         }
@@ -1118,13 +1204,21 @@ fn alter_table(from: &Body, to: &Body, pairs: &[(String, String)], made: &BTreeS
     // An index a new key would make is left to it, unless this statement drops one: another key
     // may need it until the new one is in place, so both go in the same statement.
     let swaps = clauses.iter().any(|c| c.starts_with("drop index ") || c == "drop primary key");
-    for (name, _, def) in to.indexes.iter().filter(|(n, _, _)| swaps || !made.contains(n)) {
-        if from.indexes.iter().find(|(n, _, _)| n == name).is_none_or(|(_, _, d)| index_now(d) != *def) {
+    // A column made AUTO_INCREMENT needs a key in the statement that makes it so, which one a
+    // foreign key would make only after.
+    let counts: Vec<&String> = to.columns.iter().filter(|c| c.rest.split_whitespace().any(|w| w == "auto_increment") && from.column(&c.name).is_none_or(|was| !was.rest.split_whitespace().any(|w| w == "auto_increment"))).map(|c| &c.name).collect();
+    let keys_a_count = |def: &str| counts.iter().any(|c| reads(def, c));
+    for (name, _, def) in to.indexes.iter().filter(|(n, _, d)| swaps || !made.contains(n) || keys_a_count(d)) {
+        let was = from.indexes.iter().find(|(n, _, _)| n == name);
+        if was.is_some_and(|(_, _, d)| seen_only(&index_now(d), def) && !indexes_on(d)) {
+            continue;
+        }
+        if was.is_none_or(|(_, _, d)| index_now(d) != *def || indexes_on(d)) {
             clauses.push(format!("add {def}"));
         }
     }
     for (name, _, def) in &to.checks {
-        if from.checks.iter().find(|(n, _, _)| n == name).is_none_or(|(_, _, d)| d != def) {
+        if from.checks.iter().find(|(n, _, _)| n == name).is_none_or(|(_, _, d)| d != def || checks_on(d)) {
             clauses.push(format!("add {def}"));
         }
     }
@@ -1135,9 +1229,16 @@ fn alter_table(from: &Body, to: &Body, pairs: &[(String, String)], made: &BTreeS
     }
     for (key, _) in &from.options {
         if to.option(key).is_none() {
+            // An option of a number takes 0 for its default: MySQL's grammar refuses `default` there.
             clauses.push(match key.as_str() {
                 "comment" => "comment=''".to_string(),
-                "key_block_size" => "key_block_size=0".to_string(),
+                "key_block_size" | "checksum" | "delay_key_write" | "max_rows" | "min_rows" | "avg_row_length" | "autoextend_size" => format!("{key}=0"),
+                "engine_attribute" | "secondary_engine_attribute" | "connection" => format!("{key}=''"),
+                // Those whose grammar has no `default`, each by the value it starts with.
+                "compression" => "compression='None'".to_string(),
+                "secondary_engine" => "secondary_engine=null".to_string(),
+                "insert_method" => "insert_method=no".to_string(),
+                "tablespace" => "tablespace=innodb_file_per_table".to_string(),
                 _ => format!("{key}=default"),
             });
         }
@@ -1146,15 +1247,26 @@ fn alter_table(from: &Body, to: &Body, pairs: &[(String, String)], made: &BTreeS
     let fulltext: Vec<usize> = clauses.iter().enumerate().filter(|(_, c)| c.starts_with("add fulltext ")).map(|(k, _)| k).skip(1).collect();
     let mut later: Vec<String> = fulltext.iter().rev().map(|k| clauses.remove(*k)).collect::<Vec<_>>();
     later.reverse();
+    // A table's partitioning changes apart from its body: where the body changes too, the old
+    // goes first, since a key the body changes may leave out a column it partitions by, and the
+    // new comes last, by the keys the body made. Alone, it is one statement.
     let mut out = Vec::new();
+    if !first.is_empty() {
+        out.push(format!("alter table {} {}", to.q, first.join(", ")));
+    }
+    let repartitions = from.partition != to.partition;
+    let apart = repartitions && !from.partition.is_empty() && (to.partition.is_empty() || !clauses.is_empty());
+    if apart {
+        out.push(format!("alter table {} remove partitioning", to.q));
+    }
     match clauses.len() {
         0 => {}
         1 => out.push(format!("alter table {} {}", to.q, clauses[0])),
         _ => out.push(format!("alter table {}\n  {}", to.q, clauses.join(",\n  "))),
     }
     out.extend(later.iter().map(|c| format!("alter table {} {c}", to.q)));
-    if from.partition != to.partition {
-        out.push(if to.partition.is_empty() { format!("alter table {} remove partitioning", to.q) } else { format!("alter table {} {}", to.q, to.partition) });
+    if repartitions && !to.partition.is_empty() {
+        out.push(format!("alter table {} {}", to.q, to.partition));
     }
     out
 }
@@ -1174,13 +1286,64 @@ fn made_by_keys(from: &[String], to: &[String]) -> BTreeSet<String> {
 #[derive(Default)]
 pub struct MysqlAlterer {
     decided: super::Decided,
+    /// Whether the session's sql_mode is not strict, so that a column changed to a type that can't
+    /// hold one of its values clamps or cuts the value short where a strict one fails the change.
+    clamps: bool,
 }
 
 impl MysqlAlterer {
+    /// The alterer for a session whose sql_mode is `mode`.
+    pub fn for_mode(mode: &str) -> MysqlAlterer {
+        let strict = mode.split(',').any(|m| matches!(m.trim(), "STRICT_TRANS_TABLES" | "STRICT_ALL_TABLES" | "TRADITIONAL"));
+        MysqlAlterer { clamps: !strict, ..MysqlAlterer::default() }
+    }
+
     /// The columns of a table renamed between two of its bodies: the planner's decision where it
     /// made one, else its rule.
     fn pairs(&self, table: &str, from: &Body, to: &Body) -> Vec<(String, String)> {
         self.decided.of(table).unwrap_or_else(|| renames(from, to))
+    }
+}
+
+/// `text` with each name after its first parenthesis that names one of `columns` in another case
+/// written as the column is named. A bare word MySQL reserves is a keyword (`as`), never a column,
+/// which a statement would quote.
+fn columns_as_named(text: &str, columns: &[Column], reserved: &BTreeSet<String>) -> String {
+    let Some(open) = text.find('(') else { return text.to_string() };
+    let mut out = text[..open].to_string();
+    let mut at = open;
+    for t in tokenize(&text[open..], Dialect::Mysql) {
+        let (start, end) = (open + t.start, open + t.end);
+        out.push_str(&text[at..start]);
+        let bare = match t.kind {
+            TokenKind::Word if !reserved.contains(&t.text.to_ascii_uppercase()) => Some(t.text.clone()),
+            TokenKind::Quoted => Some(t.text.trim_matches('`').replace("``", "`")),
+            _ => None,
+        };
+        match bare.and_then(|b| columns.iter().find(|c| c.name != b && c.name.eq_ignore_ascii_case(&b))) {
+            Some(c) => out.push_str(&c.q),
+            None => out.push_str(&text[start..end]),
+        }
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+/// Whether a definition reads the column named `column`, by any token naming it.
+fn reads(text: &str, column: &str) -> bool {
+    tokenize(text, Dialect::Mysql).iter().any(|t| match t.kind {
+        TokenKind::Word => t.text.eq_ignore_ascii_case(column),
+        TokenKind::Quoted => t.text.trim_matches('`').replace("``", "`").eq_ignore_ascii_case(column),
+        _ => false,
+    })
+}
+
+/// An index's definition without its visibility, and whether it is invisible.
+fn unseen(def: &str) -> (&str, bool) {
+    match def.strip_suffix(" invisible") {
+        Some(base) => (base, true),
+        None => (def, false),
     }
 }
 
@@ -1212,6 +1375,97 @@ fn type_class(def: &str) -> super::TypeClass {
     }
 }
 
+/// Whether every value of the MySQL type `a` is a value of `b` too, so that a change from one to the
+/// other keeps every value under any sql_mode. Where it can't tell, no.
+fn holds_all(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim().to_lowercase(), b.trim().to_lowercase());
+    if a == b {
+        return true;
+    }
+    let parse = |t: &str| -> (String, Vec<u32>, bool) {
+        let name: String = t.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+        let args = t.find('(').and_then(|o| Some(&t[o + 1..o + t[o..].find(')')?])).map(|x| x.split(',').filter_map(|n| n.trim().parse().ok()).collect()).unwrap_or_default();
+        (name, args, t.split_whitespace().any(|w| w == "unsigned"))
+    };
+    let ((x, xa, xu), (y, ya, yu)) = (parse(&a), parse(&b));
+    let bytes = |n: &str| match n {
+        "tinyint" => Some(1),
+        "smallint" => Some(2),
+        "mediumint" => Some(3),
+        "int" | "integer" => Some(4),
+        "bigint" => Some(8),
+        _ => None,
+    };
+    // The digits of an integer type's widest value, and a sign.
+    let digits = |n: u32, unsigned: bool| [0, 3, 5, 8, 10, 0, 0, 0, 20][n as usize] - u32::from(!unsigned && n == 8) + u32::from(!unsigned);
+    // The most characters a value of a string type can hold (each of one byte), and the fewest
+    // it is sure to hold (each of four, in utf8mb4): a change keeps every value where the source's
+    // most fit the target's fewest.
+    let most = |n: &str, args: &[u32]| -> Option<u64> {
+        match n {
+            "char" | "varchar" => Some(u64::from(args.first().copied().unwrap_or(1))),
+            "tinytext" => Some(255),
+            "text" => Some(65_535),
+            "mediumtext" => Some(16_777_215),
+            "longtext" => Some(4_294_967_295),
+            _ => None,
+        }
+    };
+    let fewest = |n: &str, args: &[u32]| -> Option<u64> {
+        match n {
+            "char" | "varchar" => Some(u64::from(args.first().copied().unwrap_or(1))),
+            "tinytext" => Some(63),
+            "text" => Some(16_383),
+            "mediumtext" => Some(4_194_303),
+            "longtext" => Some(1_073_741_823),
+            _ => None,
+        }
+    };
+    let set = |t: &str| -> Vec<String> { t.find('(').map(|o| t[o + 1..t.len().saturating_sub(1)].split(',').map(|l| l.trim().to_string()).collect()).unwrap_or_default() };
+    let precision = |args: &[u32]| args.first().copied().unwrap_or(0);
+    match (x.as_str(), y.as_str()) {
+        (p, q) if bytes(p).is_some() && bytes(q).is_some() => {
+            let (m, n) = (bytes(p).unwrap(), bytes(q).unwrap());
+            match (xu, yu) {
+                (false, true) => false,
+                (true, false) => n > m,
+                _ => n >= m,
+            }
+        }
+        (p, "decimal" | "numeric") if bytes(p).is_some() => {
+            let (dp, ds) = (ya.first().copied().unwrap_or(10), ya.get(1).copied().unwrap_or(0));
+            (!yu || xu) && dp - ds >= digits(bytes(p).unwrap(), true)
+        }
+        (p, "double" | "real") if bytes(p).is_some() => ya.is_empty() && bytes(p).unwrap() <= 4 && (!yu || xu),
+        (p, "float") if bytes(p).is_some() => ya.is_empty() && bytes(p).unwrap() <= 2 && (!yu || xu),
+        (p, q) if bytes(p).is_some() && fewest(q, &ya).is_some() => fewest(q, &ya).unwrap() >= u64::from(digits(bytes(p).unwrap(), xu)),
+        ("decimal" | "numeric", "decimal" | "numeric") => {
+            let (p1, s1) = (xa.first().copied().unwrap_or(10), xa.get(1).copied().unwrap_or(0));
+            let (p2, s2) = (ya.first().copied().unwrap_or(10), ya.get(1).copied().unwrap_or(0));
+            (!yu || xu) && s2 >= s1 && p2 - s2 >= p1 - s1
+        }
+        ("float", "double" | "real") => xa.is_empty() && ya.is_empty() && (!yu || xu),
+        ("char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext", q) if fewest(q, &ya).is_some() => {
+            // A char drops the trailing spaces a varchar or text value has.
+            fewest(q, &ya).unwrap() >= most(&x, &xa).unwrap() && (x == "char" || y != "char")
+        }
+        ("varbinary", "varbinary") => ya.first().copied().unwrap_or(0) >= xa.first().copied().unwrap_or(0),
+        ("varbinary", "blob" | "mediumblob" | "longblob") => true,
+        ("tinyblob", "blob" | "mediumblob" | "longblob") | ("blob", "mediumblob" | "longblob") | ("mediumblob", "longblob") => true,
+        ("enum", "enum") | ("set", "set") => {
+            let to = set(&b);
+            set(&a).iter().all(|l| to.contains(l))
+        }
+        ("date", "datetime") => true,
+        ("datetime", "datetime") | ("timestamp", "timestamp" | "datetime") | ("time", "time") => precision(&ya) >= precision(&xa),
+        ("year", q) => bytes(q).is_some_and(|n| n >= 2),
+        ("bit", "bit") => ya.first().copied().unwrap_or(1) >= xa.first().copied().unwrap_or(1),
+        ("json", "longtext") => true,
+        (_, "longtext") => bytes(&x).is_some() || matches!(x.as_str(), "decimal" | "numeric" | "float" | "double" | "date" | "datetime" | "timestamp" | "time" | "year"),
+        _ => false,
+    }
+}
+
 /// The type a column's definition opens with: `decimal(10,2) unsigned` of `decimal(10,2) unsigned not null`.
 fn type_of(def: &str) -> String {
     let words: Vec<&str> = def.split_whitespace().collect();
@@ -1219,7 +1473,64 @@ fn type_of(def: &str) -> String {
     words[..n.min(words.len())].join(" ")
 }
 
+/// A `grant` or `revoke` of the planner's split where MySQL reads it: whether it grants, its
+/// privilege, and what follows it (`on … to …`), each outside backticks.
+fn privilege_parts(statement: &str) -> Option<(bool, &str, &str)> {
+    let (grant, rest) = match (statement.strip_prefix("grant "), statement.strip_prefix("revoke ")) {
+        (Some(rest), _) => (true, rest),
+        (_, Some(rest)) => (false, rest),
+        _ => return None,
+    };
+    let mut quoted = false;
+    for (k, c) in rest.char_indices() {
+        match c {
+            '`' => quoted = !quoted,
+            ' ' if !quoted && rest[k..].starts_with(" on ") => return Some((grant, &rest[..k], &rest[k..])),
+            _ => {}
+        }
+    }
+    None
+}
+
 impl Alterer for MysqlAlterer {
+    /// The privileges granted (or revoked) on one object to one account, which MySQL takes in one
+    /// statement, written as one where the plan has them one after another: `grant select, update
+    /// (email) on users to … with grant option`. Only those side by side: one further on may wait
+    /// for what the plan makes between them (a column it grants on).
+    fn finish(&self, statements: &mut Vec<String>) {
+        // Each statement, or a run of grants (or of revokes) on one object to one account.
+        let mut runs: Vec<(String, Option<(bool, Vec<String>, String)>)> = Vec::new();
+        for s in statements.drain(..) {
+            let Some((grant, privilege, rest)) = privilege_parts(&s) else {
+                runs.push((s, None));
+                continue;
+            };
+            if let Some((_, Some((g, privileges, r)))) = runs.last_mut() {
+                if *g == grant && r.as_str() == rest {
+                    privileges.push(privilege.to_string());
+                    continue;
+                }
+            }
+            runs.push((String::new(), Some((grant, vec![privilege.to_string()], rest.to_string()))));
+        }
+        *statements = runs
+            .into_iter()
+            .map(|(s, run)| match run {
+                None => s,
+                Some((grant, privileges, rest)) => {
+                    let option = privileges.iter().any(|p| p == "grant option");
+                    let others: Vec<&String> = privileges.iter().filter(|p| *p != "grant option").collect();
+                    let list = others.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", ");
+                    match (grant, option, others.is_empty()) {
+                        (true, true, false) => format!("grant {list}{rest} with grant option"),
+                        (_, true, false) => format!("revoke {list}, grant option{rest}"),
+                        (verb, _, _) => format!("{} {}{rest}", if verb { "grant" } else { "revoke" }, privileges.join(", ")),
+                    }
+                }
+            })
+            .collect();
+    }
+
     fn narrows(&self, from: &Object, to: &Object) -> Option<String> {
         if from.kind != Some(Kind::Column) {
             return None;
@@ -1236,8 +1547,14 @@ impl Alterer for MysqlAlterer {
             _ => {}
         }
         let (a, b) = (type_of(&from.def), type_of(&to.def));
-        let why = super::narrowing(&type_class(&a), &type_class(&b))?;
-        Some(format!("changes from {a} to {b}, which {why}"))
+        if let Some(why) = super::narrowing(&type_class(&a), &type_class(&b)) {
+            return Some(format!("changes from {a} to {b}, which {why}"));
+        }
+        // Other changes fail on a value the new type can't hold, but only under a strict sql_mode.
+        if self.clamps && !holds_all(&a, &b) {
+            return Some(format!("changes from {a} to {b}, which clamps or cuts short a value it can't hold, since this session's sql_mode isn't strict"));
+        }
+        None
     }
 
     fn decide(&self, renames: &[(String, String)]) {
@@ -1311,6 +1628,21 @@ mod tests {
         assert_eq!(body.checks, [("c".to_string(), "c".to_string(), "constraint c check ((id > 0))".to_string())]);
         assert_eq!(body.option("comment"), Some("'People'"));
         assert_eq!(body.option("auto_increment"), None);
+        assert!(body.counter.is_some());
         assert_eq!(body.partition, "partition by hash (id) partitions 2");
+    }
+
+    #[test]
+    fn a_change_that_keeps_every_value_needs_no_strict_mode() {
+        for (a, b) in [("tinyint", "int"), ("int unsigned", "bigint"), ("int", "decimal(12,0)"), ("smallint", "varchar(6)"), ("varchar(10)", "text"), ("text", "mediumtext"), ("tinytext", "varchar(255)"), ("char(4)", "varchar(4)"), ("decimal(5,2)", "decimal(7,3)"), ("enum('a','b')", "enum('b','a','c')"), ("date", "datetime"), ("datetime(3)", "datetime(6)"), ("float", "double"), ("int", "longtext")] {
+            assert!(holds_all(a, b), "{a} to {b}");
+        }
+        for (a, b) in [("tinytext", "varchar(63)"), ("longtext", "mediumtext"), ("varchar(20000)", "text"), ("int", "tinyint"), ("int", "int unsigned"), ("int unsigned", "int"), ("varchar(10)", "varchar(3)"), ("varchar(4)", "char(4)"), ("decimal(5,2)", "decimal(5,1)"), ("enum('a','b')", "enum('a')"), ("datetime", "timestamp"), ("datetime(6)", "datetime"), ("double", "float"), ("bigint", "double"), ("int", "varchar(5)")] {
+            assert!(!holds_all(a, b), "{a} to {b}");
+        }
+        let column = |def: &str| Object { kind: Some(Kind::Column), def: def.into(), ..Object::default() };
+        assert_eq!(MysqlAlterer::for_mode("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES").narrows(&column("int"), &column("tinyint")), None);
+        assert!(MysqlAlterer::for_mode("NO_ENGINE_SUBSTITUTION").narrows(&column("int"), &column("tinyint")).is_some());
+        assert_eq!(MysqlAlterer::for_mode("").narrows(&column("int"), &column("bigint")), None);
     }
 }

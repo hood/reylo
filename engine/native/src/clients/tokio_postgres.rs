@@ -1,58 +1,44 @@
 //! The Postgres engine's needs answered over a `tokio-postgres` client: a describe with the
 //! statement's parameter types and each column's type, table and column number, and a catalog
-//! query with its parameters bound by the types the server infers for them.
+//! query with its parameters bound by the types the server infers for them. The needs of a round
+//! are asked together, which the client pipelines over its one connection.
 
+use crate::replay::ConcurrentAnswerer;
 use crate::{AnswerCache, Analysis, AsyncAnswerer, DbError, HostError, ReplayError};
 use ::tokio_postgres::types::{ToSql, Type};
-use ::tokio_postgres::{Client, Statement};
-use reylo_engine_core::api::{Answer, Need};
+use ::tokio_postgres::Client;
 use reylo_engine_core::database::Database;
 use reylo_engine_postgres::Postgres;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Mutex;
 
 /// What a Postgres describe is answered with.
 pub type Describe = <Postgres as Database>::Describe;
 
-/// The analysis of `sql`, its needs answered over `client`.
+/// The analysis of `sql`, its needs answered over `client`, each round's together.
 pub async fn analyze(client: &Client, sql: &str, cache: &mut AnswerCache<Describe>) -> Result<Analysis, ReplayError<HostError>> {
-    analyze_prepared(client, &Prepared::default(), sql, cache).await
-}
-
-/// As [`analyze`], with each catalog query prepared once in `prepared` and reused after that.
-pub async fn analyze_prepared(client: &Client, prepared: &Prepared, sql: &str, cache: &mut AnswerCache<Describe>) -> Result<Analysis, ReplayError<HostError>> {
-    crate::replay::run_async::<Postgres, _>(sql, &mut Answers(client, prepared), cache).await
-}
-
-/// The catalog queries prepared over one client, by their text.
-#[derive(Default)]
-pub struct Prepared(Mutex<HashMap<String, Statement>>);
-
-impl Prepared {
-    async fn statement(&self, client: &Client, sql: &str) -> Result<Statement, ::tokio_postgres::Error> {
-        if let Some(stmt) = self.0.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
-            return Ok(stmt.clone());
-        }
-        let stmt = client.prepare(sql).await?;
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(sql.to_string(), stmt.clone());
-        Ok(stmt)
-    }
+    crate::replay::run_concurrent::<Postgres, _>(sql, &Answers(client), cache).await
 }
 
 /// The engine's needs, answered over a client.
-pub struct Answers<'a>(pub &'a Client, pub &'a Prepared);
+pub struct Answers<'a>(pub &'a Client);
 
 impl AsyncAnswerer<Describe> for Answers<'_> {
     type Error = HostError;
 
-    fn answer_all(&mut self, needs: &[Need]) -> impl Future<Output = Vec<Result<Answer<Describe>, HostError>>> + Send {
-        let Answers(client, prepared) = *self;
-        futures_util::future::join_all(needs.iter().map(move |need| async move { crate::replay::answer_async(&mut Answers(client, prepared), need).await }))
+    fn describe(&mut self, sql: &str) -> impl Future<Output = Result<Result<Describe, DbError>, HostError>> + Send {
+        ConcurrentAnswerer::describe(&*self, sql)
     }
 
-    fn describe(&mut self, sql: &str) -> impl Future<Output = Result<Result<Describe, DbError>, HostError>> + Send {
+    fn query(&mut self, sql: &str, params: &[Value]) -> impl Future<Output = Result<Result<Vec<Vec<Value>>, DbError>, HostError>> + Send {
+        ConcurrentAnswerer::query(&*self, sql, params)
+    }
+}
+
+impl ConcurrentAnswerer<Describe> for Answers<'_> {
+    type Error = HostError;
+
+    fn describe(&self, sql: &str) -> impl Future<Output = Result<Result<Describe, DbError>, HostError>> + Send {
         let client = self.0;
         async move {
             match client.prepare(sql).await {
@@ -83,11 +69,11 @@ impl AsyncAnswerer<Describe> for Answers<'_> {
         }
     }
 
-    fn query(&mut self, sql: &str, params: &[Value]) -> impl Future<Output = Result<Result<Vec<Vec<Value>>, DbError>, HostError>> + Send {
-        let Answers(client, prepared) = *self;
+    fn query(&self, sql: &str, params: &[Value]) -> impl Future<Output = Result<Result<Vec<Vec<Value>>, DbError>, HostError>> + Send {
+        let client = self.0;
         async move {
             let failed = |what: &str, e: ::tokio_postgres::Error| HostError(if ended(&e) { format!("{ENDED}: {}", pg_message(&e)) } else { format!("catalog query {what}: {}\n    {sql}", pg_message(&e)) });
-            let stmt = prepared.statement(client, sql).await.map_err(|e| failed("failed to prepare", e))?;
+            let stmt = client.prepare(sql).await.map_err(|e| failed("failed to prepare", e))?;
             let mut values: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
             for (ty, value) in stmt.params().iter().zip(params) {
                 values.push(bind(ty, value).ok_or_else(|| HostError(format!("cannot bind {value} as {ty} for the catalog query\n    {sql}")))?);
@@ -96,6 +82,11 @@ impl AsyncAnswerer<Describe> for Answers<'_> {
             let rows = client.query(&stmt, &refs).await.map_err(|e| failed("failed", e))?;
             Ok(Ok(rows.iter().map(|row| (0..row.len()).map(|i| cell(row, i)).collect()).collect()))
         }
+    }
+
+    // A prepare dropped after its Parse is sent has no statement to close, so on a session that goes on it is left to finish.
+    fn ends_session(&self, error: &HostError) -> bool {
+        self.0.is_closed() || error.0.starts_with(ENDED)
     }
 }
 

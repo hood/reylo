@@ -53,11 +53,20 @@ test("the migration commands and reylo run are the binary's, with their output a
   for (const usage of ["  migrate <command>", "  db <command>", "  run \"<sql>\""]) assert.ok(help.out.includes(usage), usage);
   const migrate = reylo(root, ["migrate", "--help"]);
   assert.equal(migrate.status, 0, migrate.err);
-  assert.match(migrate.out, /^Usage: reylo <group> <command> \[flags\]\n/);
-  assert.equal(reylo(root, ["db", "--help"]).out, migrate.out);
-  // The docs show the help as it is.
-  // A checkout on Windows may write the page with CRLF line endings.
-  assert.ok(readFileSync(join(import.meta.dirname, "..", "site", "content", "docs", "migrations.mdx"), "utf8").replaceAll("\r\n", "\n").includes(`\`\`\`terminal\n${migrate.out}\`\`\``));
+  assert.match(migrate.out, /^Usage: reylo migrate <command> \[flags\]\n/);
+  assert.match(migrate.out, /\n  history push  /);
+  assert.doesNotMatch(migrate.out, /\n  (push|reset|wipe|introspect)  /);
+  const dbHelp = reylo(root, ["db", "--help"]);
+  assert.equal(dbHelp.status, 0, dbHelp.err);
+  assert.match(dbHelp.out, /^Usage: reylo db <command> \[flags\]\n/);
+  assert.match(dbHelp.out, /\n  introspect  /);
+  assert.doesNotMatch(dbHelp.out, /\n  (init|new|dev|deploy|status|lock|history)\b/);
+  // The docs show each group's help as it is.
+  // A checkout on Windows may write a page with CRLF line endings.
+  for (const page of ["migrate.mdx", "cli.mdx"]) {
+    const text = readFileSync(join(import.meta.dirname, "..", "site", "content", "docs", page), "utf8").replaceAll("\r\n", "\n");
+    for (const help of [migrate.out, dbHelp.out]) assert.ok(text.includes(`\`\`\`terminal\n${help}\`\`\``), `${page}: ${help.split("\n")[0]}`);
+  }
   const run = reylo(root, ["run", "insert into users (name) values ('ada')", "insert into users (name) values ('grace')"]);
   assert.equal(run.status, 0, run.err);
   const db = new DatabaseSync(join(root, "app.db"));
@@ -68,7 +77,7 @@ test("the migration commands and reylo run are the binary's, with their output a
   // A SQLite file that isn't there is refused, never made, as the migrations' commands refuse it.
   const absent = reylo(root, ["run", `--url=sqlite:${other}`, "create table here (id integer)"]);
   assert.equal(absent.status, 1);
-  assert.match(absent.out + absent.err, /No SQLite database at /);
+  assert.match(absent.out + absent.err, /There's no SQLite database at /);
   assert.ok(!existsSync(other));
   new DatabaseSync(other).close();
   assert.equal(reylo(root, ["run", `--url=sqlite:${other}`, "create table here (id integer)"]).status, 0);
@@ -103,7 +112,8 @@ test("the migration commands and reylo run are the binary's, with their output a
     assert.equal(r.status, 2, args.join(" "));
     assert.match(r.err, said);
   }
-  assert.match(reylo(root, ["migrate", "deploy", "--help"]).out, /^Usage: reylo <group> <command> \[flags\]\n/);
+  assert.match(reylo(root, ["migrate", "deploy", "--help"]).out, /^Usage: reylo migrate <command> \[flags\]\n/);
+  assert.match(reylo(root, ["db", "push", "--help"]).out, /^Usage: reylo db <command> \[flags\]\n/);
 });
 
 test("reylo migrate init starts a project, and needs nothing in the project file", () => {
@@ -120,8 +130,12 @@ test("reylo migrate init starts a project, and needs nothing in the project file
     const r = reylo(root, args);
     assert.equal(r.status, 0, `${args.join(" ")}: ${r.err}${r.out}`);
   }
-  // What db introspect prints is the schema init wrote, and it writes nothing.
-  assert.equal(reylo(root, ["db", "introspect"]).out, readFileSync(join(root, "reylo", "schema.sql"), "utf8"));
+  // What db introspect prints is the schema init wrote, and it writes nothing. Into a pipe it is the
+  // plain SQL alone: no colour, and no spinner on stderr.
+  const introspected = reylo(root, ["db", "introspect"]);
+  assert.equal(introspected.out, readFileSync(join(root, "reylo", "schema.sql"), "utf8"));
+  assert.doesNotMatch(introspected.out, /\x1b/);
+  assert.equal(introspected.err, "");
   // A key that has gone is refused, as any key the file can't have.
   writeFileSync(join(root, ".reylo.yaml"), "migrate:\n  lock: true\n");
   assert.notEqual(reylo(root, ["migrate", "status"]).status, 0);
@@ -152,7 +166,7 @@ test("every command that reads or writes the lock refuses it under its old name,
   for (const args of LOCK_COMMANDS) {
     const r = reylo(root, args);
     assert.equal(r.status, 1, `${args.join(" ")}: ${r.err}${r.out}`);
-    assert.match(r.out, /^✗ reylo\/reylo-lock\.yaml is the lock's old name: it is reylo\/reylo\.lock now\n[\s\S]*\n  Rename it:\n    git mv reylo\/reylo-lock\.yaml reylo\/reylo\.lock\n\nNothing was changed\.\n$/, args.join(" "));
+    assert.match(r.out, /^✗ The lock's old name is reylo\/reylo-lock\.yaml: it is reylo\/reylo\.lock now\n[\s\S]*\n  Rename it:\n    git mv reylo\/reylo-lock\.yaml reylo\/reylo\.lock\n\nNothing was changed\.\n$/, args.join(" "));
     assert.deepEqual(files(), before, args.join(" "));
   }
   const json = JSON.parse(reylo(root, ["migrate", "deploy", "--json"]).out) as { ok: boolean; problems: { code: string; fixes: { commands: string[] }[] }[] };
@@ -171,7 +185,7 @@ test("every command that reads or writes the lock refuses a project that holds i
   for (const args of LOCK_COMMANDS) {
     const r = reylo(root, args);
     assert.equal(r.status, 1, `${args.join(" ")}: ${r.err}${r.out}`);
-    assert.match(r.out, /^✗ reylo\/reylo-lock\.yaml and reylo\/reylo\.lock are both here\n[\s\S]*\n    git rm reylo\/reylo-lock\.yaml\n\nNothing was changed\.\n$/, args.join(" "));
+    assert.match(r.out, /^✗ Both reylo\/reylo-lock\.yaml and reylo\/reylo\.lock are here\n[\s\S]*\n    git rm reylo\/reylo-lock\.yaml\n\nNothing was changed\.\n$/, args.join(" "));
     assert.deepEqual(files(), before, args.join(" "));
   }
   assert.equal((JSON.parse(reylo(root, ["migrate", "status", "--json"]).out) as { problems: { code: string }[] }).problems[0]!.code, "lock-old-name");

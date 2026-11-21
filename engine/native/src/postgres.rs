@@ -7,7 +7,7 @@
 
 use crate::tls::{self, Check};
 use crate::{Failure, Program};
-use crate::clients::tokio_postgres::{self as answers, Describe, Prepared};
+use crate::clients::tokio_postgres::{self as answers, Describe};
 use crate::{AnswerCache, AsyncAnswerer, ReplayError};
 use reylo_engine_core::api::Analysis;
 use serde_json::{json, Value};
@@ -42,10 +42,11 @@ struct Connection {
     bridge: Option<String>,
     /// The engine's answers, kept between statements as the loader's session keeps them.
     answers: AnswerCache<Describe>,
-    prepared: Prepared,
     /// The session's `DateStyle` as the server reported it when the connection started, from its
     /// role, its database or the server's own setting.
     date_style: String,
+    /// What a session of this connection runs under, set again on a connection that replaces it.
+    setup: Option<String>,
 }
 
 impl Connection {
@@ -54,17 +55,20 @@ impl Connection {
     /// while a request does: that request is answered over the new one.
     async fn reopen(&mut self) -> Result<(), Value> {
         let Started { client, date_style, .. } = connect(&self.url, self.bridge.as_deref()).await?;
-        (self.client, self.date_style, self.prepared) = (client, date_style, Prepared::default());
+        if let Some(setup) = &self.setup {
+            client.batch_execute(setup).await.map_err(|e| json!({ "status": "unreachable", "message": e.to_string() }))?;
+        }
+        (self.client, self.date_style) = (client, date_style);
         Ok(())
     }
 
     /// The analysis of one statement over the connection, opened again once where the server
     /// closed it; a failure is the answer the program gives for it.
     async fn analyze(&mut self, sql: &str) -> Result<Analysis, Value> {
-        let mut result = answers::analyze_prepared(&self.client, &self.prepared, sql, &mut self.answers).await;
+        let mut result = answers::analyze(&self.client, sql, &mut self.answers).await;
         if matches!(&result, Err(ReplayError::Host(e)) if self.client.is_closed() || e.0.starts_with(answers::ENDED)) {
             self.reopen().await?;
-            result = answers::analyze_prepared(&self.client, &self.prepared, sql, &mut self.answers).await;
+            result = answers::analyze(&self.client, sql, &mut self.answers).await;
         }
         match result {
             Ok(mut analysis) => {
@@ -76,6 +80,26 @@ impl Connection {
             Err(e) => Err(json!({ "status": "error", "message": e.to_string() })),
         }
     }
+}
+
+/// Why an analysis can't run through the transaction pooler a URL names: Supabase's pooler on port
+/// 6543, whose transaction mode shares server sessions between clients and keeps one client's
+/// prepared statements on them for the next, so the statements an analysis prepares collide by
+/// name with those another type check, or one that was stopped, left there ("prepared statement
+/// \"s5\" already exists"), and its describes fail. Its session pooler and the direct connection
+/// give each client a session of its own.
+pub fn transaction_pooler(url: &str) -> Option<String> {
+    let Parsed { config, .. } = parse(url, &|key| std::env::var(key).ok()).ok()?;
+    let ports = config.get_ports();
+    config.get_hosts().iter().enumerate().find_map(|(i, host)| {
+        let tokio_postgres::config::Host::Tcp(name) = host else { return None };
+        let port = ports.get(i).or(ports.first()).copied().unwrap_or(5432);
+        // A name may end in the root's dot, as the same host's absolute form.
+        let lower = name.to_ascii_lowercase();
+        (port == 6543 && lower.strip_suffix('.').unwrap_or(&lower).ends_with(".pooler.supabase.com")).then(|| {
+            format!("{name}:6543 is Supabase's transaction pooler, which shares server sessions between clients, and the statements the type check prepares on one collide with other clients' there: point direct_url in .reylo.yaml at its session pooler, port 5432 on the same host, or at the direct connection")
+        })
+    })
 }
 
 /// A connection to the database a libpq URL names, as the program opens one, and the server's
@@ -142,8 +166,24 @@ pub struct Session {
 
 impl Session {
     pub async fn open(url: &str) -> Result<Session, Failure> {
+        if let Some(refusal) = transaction_pooler(url) {
+            return Err(Failure::Error(refusal));
+        }
         let Started { client, version, date_style } = connect(url, None).await.map_err(|answer| Failure::of(&answer))?;
-        Ok(Session { connection: Connection { client, url: url.to_string(), bridge: None, answers: AnswerCache::until_cleared(), prepared: Prepared::default(), date_style }, version: server_version(&version) })
+        Ok(Session { connection: Connection { client, url: url.to_string(), bridge: None, answers: AnswerCache::until_cleared(), date_style, setup: None }, version: server_version(&version) })
+    }
+
+    /// Drops the answers kept from earlier statements, for a caller that outlives a schema change.
+    pub fn forget(&mut self) {
+        self.connection.answers.clear();
+    }
+
+    /// Sets the session up for text an editor sends on its own: read-only, since parsing a statement can run a type's input function, and giving up on a table's lock after `seconds`. A connection that replaces this one is set up the same way.
+    pub async fn for_an_editor(&mut self, seconds: u32) -> Result<(), String> {
+        let setup = format!("set lock_timeout = '{seconds}s'; set default_transaction_read_only = on");
+        self.connection.client.batch_execute(&setup).await.map_err(|e| e.to_string())?;
+        self.connection.setup = Some(setup);
+        Ok(())
     }
 
     pub async fn analyze(&mut self, sql: &str) -> Result<Analysis, Failure> {
@@ -164,10 +204,13 @@ impl Program for Postgres {
             "open" => {
                 let url = request["url"].as_str().unwrap_or_default();
                 let bridge = request["bridge"].as_str().map(String::from);
+                if let Some(refusal) = transaction_pooler(url) {
+                    return Some(json!({ "status": "error", "message": refusal }));
+                }
                 match connect(url, bridge.as_deref()).await {
                     Ok(Started { client, version, date_style }) => {
                         self.next += 1;
-                        self.connections.insert(self.next, Connection { client, url: url.to_string(), bridge, answers: AnswerCache::until_cleared(), prepared: Prepared::default(), date_style });
+                        self.connections.insert(self.next, Connection { client, url: url.to_string(), bridge, answers: AnswerCache::until_cleared(), date_style, setup: None });
                         json!({ "status": "opened", "conn": self.next, "version": server_version(&version) })
                     }
                     Err(failure) => failure,
@@ -208,12 +251,12 @@ impl Program for Postgres {
                 None => closed(conn),
                 Some(c) => {
                     let params = request["params"].as_array().cloned().unwrap_or_default();
-                    let mut result = answers::Answers(&c.client, &c.prepared).query(sql, &params).await;
+                    let mut result = answers::Answers(&c.client).query(sql, &params).await;
                     if matches!(&result, Err(e) if c.client.is_closed() || e.0.starts_with(answers::ENDED)) {
                         if let Err(failure) = c.reopen().await {
                             return Some(failure);
                         }
-                        result = answers::Answers(&c.client, &c.prepared).query(sql, &params).await;
+                        result = answers::Answers(&c.client).query(sql, &params).await;
                     }
                     match result {
                         Ok(Ok(rows)) => json!({ "status": "rows", "rows": rows }),
@@ -587,6 +630,25 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    #[test]
+    fn an_analysis_refuses_supabases_transaction_pooler_alone() {
+        let refusal = transaction_pooler("postgresql://postgres.abc:p%40ss@AWS-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require").expect("the transaction pooler");
+        assert!(refusal.starts_with("AWS-1-us-east-1.pooler.supabase.com:6543 is Supabase's transaction pooler"), "{refusal}");
+        assert!(!refusal.contains("p@ss") && !refusal.contains("p%40ss"), "{refusal}");
+        assert!(transaction_pooler("postgresql://postgres.abc:x@aws-1-us-east-1.pooler.supabase.com.:6543/postgres").is_some(), "the host's absolute form");
+        // Its session pooler, the direct connection, and another host's port 6543 take an analysis.
+        for url in [
+            "postgresql://postgres.abc:x@aws-1-us-east-1.pooler.supabase.com:5432/postgres",
+            "postgresql://postgres:x@db.abc.supabase.co:5432/postgres",
+            "postgresql://postgres.abc:x@db.abc.supabase.co:6543/postgres",
+            "postgresql://u@my-pooler.example.com:6543/app",
+            "postgresql://u@pooler.supabase.com.example.com:6543/app",
+            "postgresql://u@127.0.0.1:6543/app",
+        ] {
+            assert_eq!(transaction_pooler(url), None, "{url}");
+        }
     }
 
     #[test]
